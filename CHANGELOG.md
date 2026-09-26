@@ -10,7 +10,7 @@ shows what a task manager shows. It also tells you why the machine is loaded,
 hot or stuttering, and which process, IRQ, device or kernel subsystem is
 responsible.
 
-![Overview tab](https://raw.githubusercontent.com/ProjectHax/culprit/v0.1.0/docs/screenshots/overview.png)
+![Overview tab](https://github.com/ProjectHax/culprit/raw/v0.1.0/docs/screenshots/overview.png)
 
 ### Highlights
 
