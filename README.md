@@ -9,6 +9,8 @@ It is written in C++20 with Qt 6 Widgets. It needs no kernel modules and no
 eBPF toolchain. It runs unprivileged, with an optional root helper for exact
 scheduler tracing.
 
+![Culprit's Overview tab: live CPU, load, memory, temperature, power, GPU, disk and network cards above the Diagnosis panel](docs/screenshots/overview.png)
+
 ## Quick start
 
 Packages for each release are on the
@@ -126,6 +128,10 @@ texts from Qt's sources.
 | **Load & I/O** | Load composition, and tables for per-CPU load, blocked (D) threads with wait channel and kernel stack, disks (utilization, IOPS, await), interrupts, softirqs, cgroup CPU-quota and memory.high throttling, and network. |
 | **Stutter** | Live probe-latency graph with the threshold, the hitch list with a per-hitch explanation, probe mode, threshold and window, the Deep trace toggle (run-queue waiters and a kernel event log), and a focus-process line. |
 | **Recordings** | Open recordings, replay them on a timeline with hitches and findings, and export text or JSON reports. |
+
+| Processes | Thermals & Power |
+|---|---|
+| ![Processes tab: per-process CPU, run-queue wait, preemptions, major faults, memory, threads and estimated watts](docs/screenshots/processes.png) | ![Thermals & Power tab: hwmon sensors with session min/max, per-core heatmap, CPU and GPU temperature and power, heat contributors](docs/screenshots/thermals.png) |
 
 | Action | Shortcut |
 |---|---|
@@ -400,6 +406,7 @@ packaging/    polkit action, desktop entry, icon, systemd user unit, Debian copy
 tools/induce/ problem generators for verification
 cmake/        half-core build cap, CPack settings, Qt bundling for the .deb
 licenses/     license texts of third-party software (LGPL-3.0 for Qt)
+docs/         screenshots used in this README
 .github/      GitHub Actions workflow that builds the .deb, .rpm and AppImage
 ```
 
