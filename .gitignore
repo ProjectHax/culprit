@@ -1,0 +1,9 @@
+/build/
+/build-*/
+/.cache/
+compile_commands.json
+CMakeLists.txt.user*
+*.swp
+*~
+__pycache__/
+/dist/

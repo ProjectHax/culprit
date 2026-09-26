@@ -1,0 +1,15 @@
+[Unit]
+Description=Culprit background recorder (stutter hitches, findings, 1 Hz summaries)
+Documentation=file://@CULPRIT_DOC_PATH@/README.md
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=@CULPRIT_BIN_PATH@ --record
+# Recordings go to ~/.local/share/culprit/recordings (rotated every 64 MiB).
+Nice=5
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,153 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 ProjectHax LLC
+
+# Builds the .deb (Ubuntu 22.04), .rpm (AlmaLinux 9) and AppImage packages,
+# installs each one and runs it, and attaches them to a GitHub release when a
+# v* tag is pushed. The build steps live in packaging/ci/ so they can be run
+# locally too; they compile with half the runner's CPU cores.
+
+name: Packages
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: packages-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Qt's official binaries, bundled into the .deb and the AppImage.
+  QT_VERSION: "6.10.3"
+
+jobs:
+  deb:
+    name: .deb (Ubuntu 22.04)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install build dependencies
+        run: packaging/ci/deps.sh ubuntu
+
+      - name: Cache Qt
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/qt
+          key: qt-${{ env.QT_VERSION }}-${{ hashFiles('packaging/ci/install-qt.sh') }}
+
+      - name: Install Qt ${{ env.QT_VERSION }}
+        run: packaging/ci/install-qt.sh "$QT_VERSION" "$RUNNER_TEMP/qt"
+
+      - name: Build package
+        run: packaging/ci/package.sh deb
+
+      - name: Install and run
+        run: |
+          sudo apt-get install -y ./dist/*.deb
+          culprit --version
+          culprit --snapshot --seconds 2 > /dev/null
+          QT_QPA_PLATFORM=offscreen culprit --grab "$RUNNER_TEMP/culprit.png" --seconds 3
+          test -s "$RUNNER_TEMP/culprit.png"
+          test -s /usr/share/doc/culprit/THIRD-PARTY-BUNDLED.txt
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: culprit-deb
+          path: dist/*.deb
+          if-no-files-found: error
+
+  appimage:
+    name: AppImage (Ubuntu 22.04)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install build dependencies
+        run: packaging/ci/deps.sh ubuntu
+
+      - name: Cache Qt
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/qt
+          key: qt-${{ env.QT_VERSION }}-${{ hashFiles('packaging/ci/install-qt.sh') }}
+
+      - name: Install Qt ${{ env.QT_VERSION }}
+        run: packaging/ci/install-qt.sh "$QT_VERSION" "$RUNNER_TEMP/qt"
+
+      - name: Build package
+        run: packaging/ci/package.sh appimage
+
+      - name: Run
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          app=$(ls dist/*.AppImage)
+          "$app" --version
+          "$app" --snapshot --seconds 2 > /dev/null
+          QT_QPA_PLATFORM=offscreen "$app" --grab "$RUNNER_TEMP/culprit.png" --seconds 3
+          test -s "$RUNNER_TEMP/culprit.png"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: culprit-appimage
+          path: dist/*.AppImage
+          if-no-files-found: error
+
+  rpm:
+    name: .rpm (AlmaLinux 9)
+    runs-on: ubuntu-latest
+    container: almalinux:9
+    steps:
+      - name: Install git
+        run: dnf -y -q install git
+
+      - uses: actions/checkout@v7
+
+      - name: Install build dependencies
+        run: packaging/ci/deps.sh alma
+
+      - name: Build package
+        run: packaging/ci/package.sh rpm
+
+      - name: Install and run
+        run: |
+          dnf -y install ./dist/*.rpm
+          culprit --version
+          culprit --snapshot --seconds 2 > /dev/null
+          QT_QPA_PLATFORM=offscreen culprit --grab /tmp/culprit.png --seconds 3
+          test -s /tmp/culprit.png
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: culprit-rpm
+          path: dist/*.rpm
+          if-no-files-found: error
+
+  release:
+    name: GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [deb, appimage, rpm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          sha256sum -- * > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --title "Culprit ${GITHUB_REF_NAME#v}" --generate-notes -- *

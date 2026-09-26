@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Culprit
+GenericName=System Diagnostic Monitor
+Comment=Find the culprit behind high load, heat and micro-stutters
+Exec=culprit
+Icon=culprit
+Terminal=false
+Categories=System;Monitor;Qt;
+Keywords=task manager;monitor;stutter;latency;temperature;load;processes;
+StartupWMClass=culprit
