@@ -138,6 +138,8 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
+
       - uses: actions/download-artifact@v8
         with:
           path: dist
@@ -147,7 +149,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cd dist
-          sha256sum -- * > SHA256SUMS
+          version=${GITHUB_REF_NAME#v}
+          # The release notes are this version's section of CHANGELOG.md.
+          awk -v v="$version" '/^## / { if (found) exit; found = ($2 == v); next } found' CHANGELOG.md > notes.md
+          if [ -s notes.md ]; then
+            notes=(--notes-file notes.md)
+          else
+            echo "::warning::CHANGELOG.md has no section for $version; using generated notes"
+            notes=(--generate-notes)
+          fi
+          (cd dist && sha256sum -- * > SHA256SUMS)
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-            --title "Culprit ${GITHUB_REF_NAME#v}" --generate-notes -- *
+            --title "Culprit $version" "${notes[@]}" -- dist/*

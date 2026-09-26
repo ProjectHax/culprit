@@ -101,7 +101,8 @@ build directory.
 [Packages workflow](.github/workflows/packages.yml) runs it on every push. The
 workflow installs and runs each package, and attaches all three to a GitHub
 release when a `v*` tag is pushed. The tag must match the version in
-`CMakeLists.txt`. To build a package locally, in a container of the target
+`CMakeLists.txt`. The release notes are that version's section of
+[CHANGELOG.md](CHANGELOG.md). To build a package locally, in a container of the target
 distribution:
 
 ```sh
