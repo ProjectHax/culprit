@@ -17,6 +17,7 @@
 #include "gui/tabs/ProcessesTab.h"
 #include "gui/tabs/RecordingsTab.h"
 #include "gui/tabs/StutterTab.h"
+#include "gui/widgets/LayoutBarrier.h"
 #include "gui/tabs/ThermalsTab.h"
 #include "gui/widgets/FindingsPanel.h"
 #include "gui/widgets/TitleBar.h"
@@ -108,7 +109,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent), settings_(Setting
 
     auto* thermals = new ThermalsTab;
     connect(tabs_, &QTabWidget::currentChanged, this,
-            [this, thermals](int) { engine_->engine()->setSensorsWatched(tabs_->currentWidget() == thermals); });
+            [this, thermals](int) { engine_->engine()->setSensorsWatched(tabs_->currentWidget() == thermals->parentWidget()); });
     addTab(thermals, QStringLiteral("thermals"), tr("Thermals && Power"));
     connect(thermals, &ThermalsTab::processActivated, this, &MainWindow::showProcess);
 
@@ -290,14 +291,14 @@ void MainWindow::exportReport()
 void MainWindow::addTab(TabPage* page, const QString& name, const QString& title)
 {
     pages_.emplace_back(name, page);
-    tabs_->addTab(page, title);
+    tabs_->addTab(new LayoutBarrier(page), title);
 }
 
 void MainWindow::showTab(const QString& name)
 {
     for (const auto& [n, page] : pages_) {
         if (n == name) {
-            tabs_->setCurrentWidget(page);
+            tabs_->setCurrentWidget(page->parentWidget());   // the page's LayoutBarrier
             return;
         }
     }

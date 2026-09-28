@@ -55,6 +55,9 @@ private:
         uint64_t ioRead = 0, ioWrite = 0;
         bool ioTried = false, ioReadable = false, haveIo = false;
         int64_t seenNs = 0;
+        int64_t readNs = 0;      // last time stat was actually read
+        int idleScans = 0;       // consecutive reads with no CPU time, sleeping
+        ProcSample last;         // repeated while an idle process isn't re-read
         bool havePrev = false;
         std::unordered_map<int, TaskState> tasks;   // hot scans only
         int64_t lastHotNs = 0;
@@ -78,6 +81,7 @@ private:
     uint64_t tickCount_ = 0;
     int64_t lastFullDScanNs_ = 0;
     uint32_t myUid_ = 0;
+    int selfPid_ = 0;
     double hz_ = 100;
     uint64_t pageSize_ = 4096;
     std::string buf_;

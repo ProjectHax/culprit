@@ -42,6 +42,8 @@ qt_add_executable(culprit
   widgets/HeaderFit.h
   widgets/HitchDetail.cpp
   widgets/HitchDetail.h
+  widgets/LayoutBarrier.cpp
+  widgets/LayoutBarrier.h
   widgets/FindingsPanel.h
   widgets/Sparkline.cpp
   widgets/Sparkline.h

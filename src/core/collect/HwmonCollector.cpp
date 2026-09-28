@@ -40,7 +40,7 @@ bool fileExists(const std::string& p)
 
 constexpr int64_t kSlowReadNs = 5'000'000;   // demote chips whose read takes longer
 constexpr int kSlowPeriodSec = 30;
-constexpr int kWatchedPeriodSec = 5;
+constexpr int kWatchedPeriodSec = 10;   // while the Thermals tab is open (a read costs ~70 ms of kernel time)
 
 } // namespace
 

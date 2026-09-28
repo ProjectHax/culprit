@@ -181,7 +181,15 @@ void Nvml::sample(int index, GpuSample& g)
         g.reasonsValid = true;
     }
 
-    // Memory per process (graphics + compute contexts).
+}
+
+void Nvml::processMemory(int index, std::vector<GpuProc>& out)
+{
+    out.clear();
+    if (!ok_ || index < 0 || index >= int(devices_.size()))
+        return;
+    std::lock_guard lock(mutex_);
+    nvmlDevice_t d = devices_[size_t(index)];
     std::unordered_map<int, uint64_t> mem;
     for (auto fn : {api_->getGraphicsProcs, api_->getComputeProcs}) {
         if (!fn)
@@ -196,7 +204,7 @@ void Nvml::sample(int index, GpuSample& g)
         GpuProc p;
         p.pid = pid;
         p.usedMemBytes = bytes;
-        g.procs.push_back(p);
+        out.push_back(p);
     }
 }
 
@@ -244,6 +252,10 @@ void Nvml::processUtilization(int index, std::unordered_map<int, GpuProc>& out)
 
 // ------------------------------------------------------------------ collector
 
+namespace {
+constexpr int64_t kGpuProcRefreshNs = 3'000'000'000;
+} // namespace
+
 void GpuCollector::sample(Frame& frame)
 {
     Nvml& nvml = Nvml::instance();
@@ -251,7 +263,9 @@ void GpuCollector::sample(Frame& frame)
         return;
     const int n = nvml.deviceCount();
     idleBaselineW_.resize(size_t(n), 1e9);
+    procCache_.resize(size_t(n));
     frame.gpus.resize(size_t(n));
+    const int64_t now = monoNs();
 
     std::unordered_map<int, ProcSample*> byPid;
     for (ProcSample& p : frame.procs)
@@ -260,20 +274,28 @@ void GpuCollector::sample(Frame& frame)
     for (int i = 0; i < n; ++i) {
         GpuSample& g = frame.gpus[size_t(i)];
         nvml.sample(i, g);
-        std::unordered_map<int, GpuProc> util;
-        nvml.processUtilization(i, util);
-        // Merge utilisation into the memory list.
-        for (GpuProc& p : g.procs) {
-            if (auto it = util.find(p.pid); it != util.end()) {
-                p.smUtil = it->second.smUtil;
-                p.memUtil = it->second.memUtil;
-                p.encUtil = it->second.encUtil;
-                p.decUtil = it->second.decUtil;
-                util.erase(it);
+        ProcCache& cache = procCache_[size_t(i)];
+        if (now - cache.refreshedNs >= kGpuProcRefreshNs) {
+            nvml.processMemory(i, cache.procs);
+            // An idle GPU has no per-process utilisation to report.
+            std::unordered_map<int, GpuProc> util;
+            if (g.utilGpu != 0)
+                nvml.processUtilization(i, util);
+            // Merge utilisation into the memory list.
+            for (GpuProc& p : cache.procs) {
+                if (auto it = util.find(p.pid); it != util.end()) {
+                    p.smUtil = it->second.smUtil;
+                    p.memUtil = it->second.memUtil;
+                    p.encUtil = it->second.encUtil;
+                    p.decUtil = it->second.decUtil;
+                    util.erase(it);
+                }
             }
+            for (auto& [pid, p] : util)
+                cache.procs.push_back(p);
+            cache.refreshedNs = now;
         }
-        for (auto& [pid, p] : util)
-            g.procs.push_back(p);
+        g.procs = cache.procs;
 
         // Power attribution: only the part above the idle floor is "caused" by apps.
         if (g.powerW > 0)

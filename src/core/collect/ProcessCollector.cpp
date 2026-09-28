@@ -21,6 +21,9 @@ namespace culprit {
 
 namespace {
 
+constexpr int kIdleScansBeforeSkip = 3;   // idle this many reads in a row ...
+constexpr uint64_t kIdleReadEvery = 3;    // ... then re-read only every third scan
+
 bool isNumeric(const char* s)
 {
     if (!*s)
@@ -79,6 +82,7 @@ QString wchanOf(const std::string& path)
 ProcessCollector::ProcessCollector()
 {
     myUid_ = getuid();
+    selfPid_ = getpid();
     const long hz = sysconf(_SC_CLK_TCK);
     hz_ = hz > 0 ? double(hz) : 100.0;
     pageSize_ = uint64_t(sysconf(_SC_PAGESIZE));
@@ -140,6 +144,22 @@ void ProcessCollector::sample(Frame& frame, int64_t nowNs, const Config& cfg)
     const std::string procRoot = SysPaths::instance().proc;
     const bool ioCatchUp = (++tickCount_ % 5) == 0;
     forEachNumericEntry(procRoot, [&](int pid) {
+        // Most processes (and nearly all kernel threads) sit idle. Once one has
+        // been idle for a few scans it is only re-read every third scan,
+        // staggered by pid, and its last sample is repeated in between: each
+        // /proc/<pid>/stat read costs ~4 µs of kernel time, ~3 ms per scan.
+        if (auto k = pidKeys_.find(pid); k != pidKeys_.end()) {
+            auto it = procs_.find(k->second);
+            if (it != procs_.end() && it->second.idleScans >= kIdleScansBeforeSkip &&
+                (tickCount_ + uint64_t(pid)) % kIdleReadEvery != 0 && !cfg.detailPids.count(pid) &&
+                pid != cfg.focusPid) {
+                seen.insert(k->second);
+                it->second.seenNs = nowNs;
+                out.push_back(it->second.last);
+                return;
+            }
+        }
+
         // Known pid? Re-read its cached stat fd. A stale fd (process exited, pid
         // possibly reused) fails with ESRCH, so it can never mix up processes.
         PidStat ps;
@@ -191,13 +211,17 @@ void ProcessCollector::sample(Frame& frame, int64_t nowNs, const Config& cfg)
 
         const uint64_t ticks = ps.utime + ps.stime;
         const bool ran = !st.havePrev || ticks != st.cpuTicks;
-        if (st.havePrev && dt > 0) {
-            s.cpuPct = ticks >= st.cpuTicks ? double(ticks - st.cpuTicks) / hz_ / dt * 100.0 : 0.0;
-            s.majfltPs = ps.majflt >= st.majflt ? double(ps.majflt - st.majflt) / dt : 0.0;
-            s.minfltPs = ps.minflt >= st.minflt ? double(ps.minflt - st.minflt) / dt : 0.0;
+        // Rates over the time since this process was last read (longer for idle ones).
+        const double pdt = st.readNs > 0 ? double(nowNs - st.readNs) / 1e9 : dt;
+        if (st.havePrev && pdt > 0) {
+            s.cpuPct = ticks >= st.cpuTicks ? double(ticks - st.cpuTicks) / hz_ / pdt * 100.0 : 0.0;
+            s.majfltPs = ps.majflt >= st.majflt ? double(ps.majflt - st.majflt) / pdt : 0.0;
+            s.minfltPs = ps.minflt >= st.minflt ? double(ps.minflt - st.minflt) / pdt : 0.0;
             if (ps.blkioTicks > 0 || st.blkio > 0)
-                s.blkioMsPs = ps.blkioTicks >= st.blkio ? double(ps.blkioTicks - st.blkio) / hz_ * 1000.0 / dt : 0.0;
+                s.blkioMsPs = ps.blkioTicks >= st.blkio ? double(ps.blkioTicks - st.blkio) / hz_ * 1000.0 / pdt : 0.0;
         }
+        st.idleScans = !ran && (ps.state == 'S' || ps.state == 'I') ? std::min(st.idleScans + 1, 1000) : 0;
+        st.readNs = nowNs;
         st.cpuTicks = ticks;
         st.majflt = ps.majflt;
         st.minflt = ps.minflt;
@@ -214,9 +238,9 @@ void ProcessCollector::sample(Frame& frame, int64_t nowNs, const Config& cfg)
             st.ioTried = true;
             st.ioReadable = st.ioFile.readSingle(buf_) && parsePidIo(buf_, io);
             if (st.ioReadable) {
-                if (st.haveIo && dt > 0) {
-                    s.ioReadBps = io.readBytes >= st.ioRead ? double(io.readBytes - st.ioRead) / dt : 0.0;
-                    s.ioWriteBps = io.writeBytes >= st.ioWrite ? double(io.writeBytes - st.ioWrite) / dt : 0.0;
+                if (st.haveIo && pdt > 0) {
+                    s.ioReadBps = io.readBytes >= st.ioRead ? double(io.readBytes - st.ioRead) / pdt : 0.0;
+                    s.ioWriteBps = io.writeBytes >= st.ioWrite ? double(io.writeBytes - st.ioWrite) / pdt : 0.0;
                 }
                 st.ioRead = io.readBytes;
                 st.ioWrite = io.writeBytes;
@@ -231,6 +255,7 @@ void ProcessCollector::sample(Frame& frame, int64_t nowNs, const Config& cfg)
 
         st.havePrev = true;
         st.seenNs = nowNs;
+        st.last = s;
         out.push_back(std::move(s));
     });
 
@@ -255,16 +280,30 @@ void ProcessCollector::sample(Frame& frame, int64_t nowNs, const Config& cfg)
 
     std::unordered_set<int> hot;
     std::unordered_set<int> switchSet;
+    // Run-queue wait only matters while tasks compete for CPUs. On a quiet system
+    // only clearly busy processes get a per-thread scan (apps with 100+ threads
+    // idling at 1% would otherwise cost more than everything else); under
+    // contention every process using more than 1% of a core does. Hysteresis
+    // keeps processes from flapping in and out.
+    const bool contended = frame.sys.runDelayTotalPct >= 10;   // ≥ 0.1 tasks waiting on average
+    const double enterPct = contended ? 1.0 : 5.0;
+    const double exitPct = contended ? 0.3 : 2.0;
     for (size_t i = 0; i < order.size() && int(hot.size()) < cfg.hotCount; ++i) {
         const ProcSample& p = out[order[i]];
-        if (p.cpuPct <= 0.5 && !prevHot_.count(p.key.pid))
+        if (p.cpuPct < exitPct)
             break;
+        if (p.cpuPct < enterPct && !prevHot_.count(p.key.pid))
+            continue;
         hot.insert(p.key.pid);
-        if (int(switchSet.size()) < cfg.switchCountTop)
+        // Preemption counts need /proc/<tid>/status for every thread (~10 µs
+        // each); they only say something while tasks compete for CPUs.
+        if (contended && int(switchSet.size()) < cfg.switchCountTop)
             switchSet.insert(p.key.pid);
     }
     for (const ProcSample& p : out) {
-        if (p.state == 'R' || p.state == 'D')
+        // A runnable process waits for a CPU only under contention (and Culprit
+        // itself is always running while it samples).
+        if ((contended && p.state == 'R' && p.key.pid != selfPid_) || p.state == 'D')
             hot.insert(p.key.pid);
     }
     for (int pid : cfg.detailPids) {
@@ -325,10 +364,11 @@ void ProcessCollector::sample(Frame& frame, int64_t nowNs, const Config& cfg)
     }
     finishDState(dstate, nowNs, fullScan || frame.sys.procsBlocked == 0);
 
-    // Hot list for the flight recorder: busiest first.
+    // Hot list for the flight recorder (who ran on a stalled CPU): busiest first.
+    // A process that can stall a CPU uses well over 2% of one.
     hotPids_.clear();
     for (size_t i = 0; i < order.size() && hotPids_.size() < 24; ++i) {
-        if (out[order[i]].cpuPct < 1.0)
+        if (out[order[i]].cpuPct < 2.0)
             break;
         hotPids_.push_back(out[order[i]].key.pid);
     }

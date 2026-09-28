@@ -20,6 +20,11 @@
 
 namespace culprit {
 
+// Full counter samples (schedstat, stat, softirqs, vmstat) are taken this often,
+// and again right after a probe reports a hitch, so every stall has one shortly
+// before and one shortly after it.
+inline constexpr int64_t kFlightFullPeriodNs = 100'000'000;
+
 // One 20 ms tick of cheap system counters. `valid` says which groups were
 // read on this tick (they run at different rates).
 struct FlightSample {
@@ -120,7 +125,8 @@ private:
     void readSoftirq(FlightSample& s);
     void readIrqs(int64_t now);
     void readHot(int64_t now);
-    void processProbes(int64_t now);
+    bool drainProbes(int64_t now);   // true if a probe crossed the hitch threshold
+    void finalizeReady(int64_t now);
     void finalize(Pending& p, int64_t now);
     void initSample(FlightSample& s) const;
 
@@ -142,6 +148,8 @@ private:
     std::deque<HotSnapshot> hotRing_;
     std::vector<Pending> pending_;
     std::deque<int64_t> recentCaptures_;
+    uint64_t lastFullTick_ = 0, lastIrqTick_ = 0;
+    bool wantFull_ = false, wantIrq_ = false;   // a hitch asked for an extra sample
 
     // readers
     std::string buf_;
@@ -156,6 +164,7 @@ private:
 
     std::mutex hotMutex_;
     std::vector<int> hotPids_;
+    std::unordered_map<int, CachedFile> hotFiles_;   // recorder thread: /proc/<pid>/stat of hot pids
 
     std::mutex avgMutex_;
     double sumRunnable_ = 0, sumBlocked_ = 0;

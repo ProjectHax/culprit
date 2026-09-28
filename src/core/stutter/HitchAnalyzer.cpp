@@ -149,7 +149,10 @@ Hitch HitchAnalyzer::analyze(const HitchCapture& cap, const Frame* lf, const std
     // A real system-wide stall (SMI, stop_machine, IPI storm) delays the timer
     // wakeups themselves; probes that merely waited runnable on busy CPUs at the
     // same moment are coincidental contention.
-    const size_t needCpus = cap.mode == ProbeMode::PerCpu ? std::max<size_t>(4, size_t(cap.probeCount) / 8) : 3;
+    // Floating mode runs only a few probes, so all of them (at least 2) stalling
+    // together counts.
+    const size_t needCpus = cap.mode == ProbeMode::PerCpu ? std::max<size_t>(4, size_t(cap.probeCount) / 8)
+                                                          : std::clamp<size_t>(size_t(cap.probeCount), 2, 3);
     h.global = simultaneous.size() >= needCpus && h.runDelayShare < 0.5;
 
     const size_t cpu = h.worstCpu >= 0 && h.worstCpu < cap.ncpu ? size_t(h.worstCpu) : 0;
@@ -157,7 +160,9 @@ Hitch HitchAnalyzer::analyze(const HitchCapture& cap, const Frame* lf, const std
 
     // ---- windows: baseline (before) vs event
     const int64_t baseA = h.t0Ns - 600'000'000, baseB = h.t0Ns - 100'000'000;
-    const int64_t evA = h.t0Ns - 45'000'000, evB = h.t1Ns + 45'000'000;
+    // A full flight sample lands at most one period before the stall and ~60 ms
+    // after it (the recorder takes an extra one when a probe reports the hitch).
+    const int64_t evA = h.t0Ns - kFlightFullPeriodNs - 5'000'000, evB = h.t1Ns + 65'000'000;
     const Span bSched = spanOf(cap.window, baseA, baseB, FlightSample::kSched);
     const Span eSched = spanOf(cap.window, evA, evB, FlightSample::kSched);
     const Span bStat = spanOf(cap.window, baseA, baseB, FlightSample::kStat);
@@ -283,20 +288,23 @@ Hitch HitchAnalyzer::analyze(const HitchCapture& cap, const Frame* lf, const std
                                 QObject::tr("%1 vs %2 before").arg(fmt::rate(ev), fmt::rate(base))});
         }
     }
-    // Hardware IRQ lines (10 Hz snapshots)
+    // Hardware IRQ lines (snapshots every 400 ms, plus one right after the hitch)
     if (cap.irqs.size() >= 2) {
         const IrqSnapshot* ba = nullptr;
         const IrqSnapshot* bb = nullptr;
         const IrqSnapshot* ea = nullptr;
         const IrqSnapshot* eb = nullptr;
+        // Snapshots come every 400 ms plus one right after the hitch, so the
+        // baseline reaches further back than the counter windows above.
+        const int64_t irqBaseA = h.t0Ns - 2'100'000'000;
         for (const IrqSnapshot& s : cap.irqs) {
-            if (s.tNs >= baseA && !ba)
+            if (s.tNs >= irqBaseA && !ba)
                 ba = &s;
             if (s.tNs <= baseB)
                 bb = &s;
             if (s.tNs <= h.t0Ns - 10'000'000)
                 ea = &s;
-            if (s.tNs >= h.t1Ns + 10'000'000 && !eb)
+            if (s.tNs >= h.t1Ns && !eb)
                 eb = &s;
         }
         if (ea && eb && eb->lines == ea->lines && eb->tNs > ea->tNs) {

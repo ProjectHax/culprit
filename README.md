@@ -182,7 +182,7 @@ Settings are stored in `~/.config/culprit/culprit.conf` and edited under
 | Sampling | Update interval | 1000 ms |
 | | Processes scanned per thread (the busiest processes get exact per-thread run-queue wait) | 40 |
 | Stutter detection | Probe mode | Floating probes |
-| | Floating probes | 4 |
+| | Floating probes | 2 |
 | | Hitch threshold: floating / per-CPU / kernel latency | 2 / 4 / 0.5 ms |
 | Diagnosis | CPU temperature limit (Tjmax) | auto-detected from the CPU model |
 | | Report processes using ≥ N cores, sustained for S seconds | 0.9 cores, 10 s |
@@ -292,23 +292,27 @@ tab, or run `culprit --report FILE`.
 
 ## How stutter detection works
 
-1. **Latency probes.** Threads sleep until an absolute 1 ms deadline with 1 ns
+1. **Latency probes.** Threads sleep until an absolute deadline with 1 ns
    timer slack. On waking, each records how late it is, and reads its own
    `/proc/thread-self/schedstat` to learn how much of that time it spent
    *runnable on a run queue*. If most of the delay was run-queue time, another
    task held the CPU. If little was, the wakeup itself was late: interrupts,
    softirqs, non-preemptible kernel code or firmware.
-   - *Floating probes* (default): 4 probes placed by the scheduler, like an
-     app's threads. Threshold 2 ms.
-   - *Per-CPU sweep*: one probe pinned to every CPU, to find the stalling CPU.
-     Threshold 4 ms, which is above EEVDF's ~3 ms base slice; waiting one
-     slice behind a busy task is normal fair scheduling.
-   - *Kernel latency (RT)*: SCHED_FIFO probes granted by rtkit, so only
-     IRQ/kernel/firmware delay remains.
-2. **Flight recorder.** A 10-second ring of cheap per-CPU counters at 25–50 Hz
-   (`/proc/schedstat`, `/proc/stat`, softirqs, vmstat, runnable/blocked
-   counts, fork counter, CPU temperature, per-core frequency, GPU clock
-   reasons) and, at 5 Hz, IRQ lines and the busiest processes' CPU time.
+   - *Floating probes* (default): 2 probes placed by the scheduler, like an
+     app's threads, waking every 2 ms. Threshold 2 ms, so every stall of 4 ms
+     or more is caught. Raise the probe count in Settings for more coverage.
+   - *Per-CPU sweep*: one probe pinned to every CPU, to find the stalling CPU,
+     waking every 2 ms. Threshold 4 ms, which is above EEVDF's ~3 ms base
+     slice; waiting one slice behind a busy task is normal fair scheduling.
+   - *Kernel latency (RT)*: SCHED_FIFO probes granted by rtkit, waking every
+     1 ms, so only IRQ/kernel/firmware delay remains.
+2. **Flight recorder.** A 10-second ring of per-CPU counters. `/proc/schedstat`,
+   `/proc/stat`, softirqs and vmstat (with runnable/blocked counts and the
+   fork counter) are read 10 times a second, and once more right after a
+   probe reports a hitch, so every stall has a sample shortly before and
+   shortly after it. CPU temperature, per-core frequency and GPU clock
+   reasons are read at 10 Hz, IRQ lines every 400 ms and after each hitch,
+   and the busiest processes' CPU time at 5 Hz.
 3. **Analysis.** Each hitch's surrounding window (−600 ms … +200 ms) is
    compared with the baseline before it. The analyzer ranks suspects: who ran
    on the stalled CPU, IRQ lines and softirq vectors above baseline,
@@ -352,14 +356,29 @@ share of one CPU core:
 
 | Component | Cost |
 |---|---|
-| Engine (full process scan with cached `/proc` fds, per-thread scan of the busiest processes, sensors, NVML, rules), 1 Hz | ≈1.5 % |
-| Stutter detection (4 probes at 1 kHz + flight recorder) | ≈3 % |
-| GUI | ≈1 % |
+| Engine (process scan, per-thread scan of busy processes, sensors, NVML, rules), 1 Hz | ≈0.8 % |
+| Flight recorder | ≈0.9 % |
+| Latency probes (2 at 500 Hz) | ≈0.4 % |
+| GUI (Overview; ≈0.8 % on the Processes tab) | ≈0.5 % |
+| **Total** | **≈2.6 %**, ~1,100 wakeups/s |
 
-Culprit is niced (+5). Super-I/O sensor chips (nct67xx, it87, …) cost about
-70 ms of kernel time per refresh, so they are polled on a separate thread
-every 30 s, or every 5 s while the Thermals tab is open. Culprit's own CPU and
-memory use are always shown in the status bar.
+Culprit is niced (+5), and it does less while the system is quiet:
+
+- Processes that stay idle are re-read every 3 s instead of every second.
+  New and busy ones are read every second.
+- Per-thread scans (run-queue wait) cover processes using more than 5% of a
+  core, or more than 1% while tasks are waiting for CPUs. Preemption counts
+  need the expensive `/proc/<tid>/status`, so they are only collected under
+  contention, or for the process you select.
+- NVIDIA per-process queries (≈2.5 ms each) run every 3 s, and not at all
+  while the GPU is idle.
+- The most expensive procfs files (`/proc/schedstat`, `/proc/interrupts`)
+  are read at 10 Hz and 2.5 Hz, plus once after each hitch.
+- Super-I/O sensor chips (nct67xx, it87, …) cost about 70 ms of kernel time
+  per refresh. They are polled on a separate thread every 30 s, or every 10 s
+  while the Thermals tab is open.
+
+Culprit's own CPU and memory use are always shown in the status bar.
 
 ## Reproducing problems
 

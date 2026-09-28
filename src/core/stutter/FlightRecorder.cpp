@@ -7,7 +7,10 @@
 #include "common/util/Clock.h"
 #include "core/collect/GpuCollector.h"
 
+#include <QtGlobal>
+
 #include <algorithm>
+#include <cstdio>
 #include <pthread.h>
 
 namespace culprit {
@@ -20,6 +23,8 @@ constexpr int64_t kPostNs = 200'000'000;         // ... and after
 constexpr int64_t kMergeNs = 50'000'000;         // late wakeups closer than this are one hitch
 constexpr int64_t kMaxHitchNs = 1'000'000'000;   // split continuous stalling into 1 s pieces
 constexpr int kMaxCapturesPerSec = 4;
+constexpr uint64_t kFullEvery = uint64_t(kFlightFullPeriodNs / kTickNs);   // 10 Hz
+constexpr uint64_t kIrqEvery = 20;                                          // 2.5 Hz
 } // namespace
 
 // ------------------------------------------------------------------ feed
@@ -129,7 +134,9 @@ bool FlightRecorder::applyProbeMode(const Settings& settings, QString* error)
         thresholdMs = settings.realtimeThresholdMs;
         break;
     default:
-        cfg.periodUs = 1000;
+        // 500 Hz: a stall 2 ms past the threshold is always caught, and two
+        // probes wake the CPU 1000 times a second instead of 4000.
+        cfg.periodUs = 2000;
         break;
     }
     thresholdNs_ = int64_t(thresholdMs * 1e6);
@@ -183,19 +190,28 @@ void FlightRecorder::loop()
 
 void FlightRecorder::tick(int64_t now, uint64_t n)
 {
-    // Probe draining runs at 50 Hz; the procfs reads are spread out by cost:
-    // /proc/schedstat (~230 µs, 12 KB) and stat/softirqs/vmstat at 25 Hz,
-    // /proc/interrupts (~530 µs, 60 KB) at 5 Hz.
+    // Probes drain at 50 Hz. The procfs reads are expensive on many-CPU machines
+    // (/proc/schedstat ~240 µs, /proc/interrupts ~520 µs with 32 CPUs), so they
+    // run at 10 Hz and 2.5 Hz, plus once right after a probe reports a hitch:
+    // that keeps a sample within ~60 ms after every stall at a third of the cost.
+    static const bool timing = qEnvironmentVariableIsSet("CULPRIT_DEBUG_TIMING");
+    const int64_t tA = timing ? monoNs() : 0;
+    if (drainProbes(now))
+        wantFull_ = wantIrq_ = true;
+    const int64_t tB = timing ? monoNs() : 0;
     FlightSample& s = ring_[head_];
     s.tNs = now;
     s.valid = 0;
-    if (n % 2 == 0) {
+    if (n % kFullEvery == 0 || (wantFull_ && n - lastFullTick_ >= 2)) {
         readSched(s);
         readStat(s);
         readSoftirq(s);
         if (vmFile_.read(buf_) && parseVmstat(buf_, s.vm))
             s.valid |= FlightSample::kVm;
+        lastFullTick_ = n;
+        wantFull_ = false;
     }
+    const int64_t tC = timing ? monoNs() : 0;
     if (n % 5 == 0) {
         int64_t mc = 0;
         if (tempFile_.readInt64(mc)) {
@@ -213,14 +229,32 @@ void FlightRecorder::tick(int64_t now, uint64_t n)
             s.valid |= FlightSample::kGpu;
         }
     }
-    if (n % 10 == 0)
+    const int64_t tD = timing ? monoNs() : 0;
+    if (n % kIrqEvery == 0 || (wantIrq_ && n - lastIrqTick_ >= 5)) {
         readIrqs(now);
+        lastIrqTick_ = n;
+        wantIrq_ = false;
+    }
+    const int64_t tE = timing ? monoNs() : 0;
     if (n % 10 == 5)
         readHot(now);
 
     head_ = (head_ + 1) % ring_.size();
     filled_ = std::min(filled_ + 1, ring_.size());
-    processProbes(now);
+    finalizeReady(now);
+    if (timing) {
+        // Per-second totals: probe drain, full counters, freq/temp/GPU, interrupts, hot processes.
+        static double sum[5];
+        const int64_t tF = monoNs();
+        const int64_t parts[5] = {tB - tA, tC - tB, tD - tC, tE - tD, tF - tE};
+        for (int i = 0; i < 5; ++i)
+            sum[i] += double(parts[i]) / 1e6;
+        if (n % 50 == 49) {
+            std::fprintf(stderr, "flight/s: drain %.2f ms, counters %.2f ms, freq+temp+gpu %.2f ms, irqs %.2f ms, hot %.2f ms\n",
+                         sum[0], sum[1], sum[2], sum[3], sum[4]);
+            std::fill(std::begin(sum), std::end(sum), 0.0);
+        }
+    }
 }
 
 void FlightRecorder::readSched(FlightSample& s)
@@ -286,7 +320,7 @@ void FlightRecorder::readIrqs(int64_t now)
         irqLines_ = lines;
     }
     IrqSnapshot snap;
-    if (irqRing_.size() >= 25) {   // 5 s at 5 Hz
+    if (irqRing_.size() >= 30) {   // ≥ 5 s at 2.5 Hz plus hitch snapshots
         snap = std::move(irqRing_.front());   // reuse the oldest buffer
         irqRing_.pop_front();
     }
@@ -309,12 +343,20 @@ void FlightRecorder::readHot(int64_t now)
         std::lock_guard lock(hotMutex_);
         pids = hotPids_;
     }
+    // Keep the stat files of hot processes open: open+close costs more than the read.
+    for (auto it = hotFiles_.begin(); it != hotFiles_.end();)
+        it = std::find(pids.begin(), pids.end(), it->first) == pids.end() ? hotFiles_.erase(it) : std::next(it);
     HotSnapshot snap;
     snap.tNs = now;
     for (int pid : pids) {
+        auto [it, inserted] = hotFiles_.try_emplace(pid);
+        if (inserted)
+            it->second.setPath(SysPaths::proc_(std::to_string(pid) + "/stat"));
         PidStat ps;
-        if (!readFile(SysPaths::proc_(std::to_string(pid) + "/stat"), buf_) || !parsePidStat(buf_, ps))
+        if (!it->second.readSingle(buf_) || !parsePidStat(buf_, ps)) {
+            hotFiles_.erase(it);   // exited (a stale fd fails rather than reading a reused pid)
             continue;
+        }
         snap.procs.push_back({pid, ps.utime + ps.stime, ps.processor, int(ps.policy)});
     }
     hotRing_.push_back(std::move(snap));
@@ -322,8 +364,9 @@ void FlightRecorder::readHot(int64_t now)
         hotRing_.pop_front();
 }
 
-void FlightRecorder::processProbes(int64_t now)
+bool FlightRecorder::drainProbes(int64_t now)
 {
+    bool hitch = false;
     LatencyFeed::Point pt;
     pt.tNs = now;
     int64_t worst = 0, worstRq = 0;
@@ -339,6 +382,7 @@ void FlightRecorder::processProbes(int64_t now)
             }
             if (ov < thresholdNs_)
                 return;
+            hitch = true;
             if (pending_.empty() || s.expectedNs > pending_.back().lastNs + kMergeNs ||
                 s.expectedNs - pending_.back().firstNs > kMaxHitchNs) {
                 pending_.push_back({});
@@ -352,7 +396,11 @@ void FlightRecorder::processProbes(int64_t now)
     pt.maxUs = float(double(worst) / 1000.0);
     pt.rqShare = worst > 0 ? float(std::clamp(double(worstRq) / double(worst), 0.0, 1.0)) : 0.f;
     feed_->push(pt);
+    return hitch;
+}
 
+void FlightRecorder::finalizeReady(int64_t now)
+{
     // Hand over hitches once the post-window has been recorded.
     while (!pending_.empty() && now - pending_.front().lastNs >= kPostNs) {
         finalize(pending_.front(), now);
@@ -384,8 +432,8 @@ void FlightRecorder::finalize(Pending& p, int64_t now)
         if (s.tNs >= from)
             cap->window.push_back(s);
     }
-    for (const IrqSnapshot& s : irqRing_)
-        if (s.tNs >= from - 100'000'000)
+    for (const IrqSnapshot& s : irqRing_)   // IRQ snapshots are sparse: a longer baseline
+        if (s.tNs >= from - 1'500'000'000)
             cap->irqs.push_back(s);
     for (const HotSnapshot& s : hotRing_)
         if (s.tNs >= from - 400'000'000)

@@ -23,10 +23,11 @@ public:
     int deviceCount() const { return int(devices_.size()); }
 
     void sample(int index, GpuSample& out);
-    // Cheap (~6 µs) query for the flight recorder.
+    // Cheap (~40 µs) query for the flight recorder.
     bool eventReasons(int index, uint64_t& reasons);
     // Per-process SM utilisation since the previous call (max per pid).
     void processUtilization(int index, std::unordered_map<int, GpuProc>& out);
+    void processMemory(int index, std::vector<GpuProc>& out);   // graphics + compute contexts
 
 private:
     Nvml();
@@ -55,6 +56,13 @@ public:
 
 private:
     std::vector<double> idleBaselineW_;   // lowest power seen per GPU: the part not attributable to any app
+    // Per-process queries cost ~2.5 ms per GPU (process utilisation alone ~2 ms),
+    // so they are refreshed every few seconds and reused in between.
+    struct ProcCache {
+        int64_t refreshedNs = 0;
+        std::vector<GpuProc> procs;
+    };
+    std::vector<ProcCache> procCache_;
 };
 
 } // namespace culprit

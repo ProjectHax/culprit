@@ -24,7 +24,7 @@ struct Settings {
 
     // Stutter detection
     ProbeMode probeMode = ProbeMode::Floating;
-    int floatingProbes = 4;
+    int floatingProbes = 2;
     double floatingThresholdMs = 2.0;
     double perCpuThresholdMs = 4.0;   // > EEVDF base slice (~3 ms): normal fair-share waits aren't hitches
     double realtimeThresholdMs = 0.5;

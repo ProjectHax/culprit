@@ -269,8 +269,10 @@ QString ProcessModel::columnTooltip(int column)
     switch (column) {
     case ColCpu: return tr("CPU usage in % of one core (can exceed 100% for multi-threaded processes).");
     case ColRunDelay: return tr("Run-queue wait: time the process's threads were runnable but waiting for a CPU, "
-                                "in ms per second. High values mean the process is being starved/delayed.");
-    case ColInvCtx: return tr("Involuntary context switches per second: how often the process was preempted.");
+                                "in ms per second. High values mean the process is being starved/delayed.\n"
+                                "Measured for busy processes (above 5% of a core, or 1% while CPUs are contended).");
+    case ColInvCtx: return tr("Involuntary context switches per second: how often the process was preempted.\n"
+                              "Measured for the selected process, and for the busiest ones while CPUs are contended.");
     case ColMajFlt: return tr("Major page faults per second (reads from disk/swap to satisfy memory accesses).");
     case ColGpu: return tr("GPU SM utilisation attributed to this process (NVIDIA only).");
     case ColPower: return tr("Estimated power: CPU core power split by CPU time × frequency, plus GPU power split "

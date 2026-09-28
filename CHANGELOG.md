@@ -3,6 +3,31 @@
 Each version's section is also its release notes on GitHub: the Packages
 workflow publishes it when a `v<version>` tag is pushed.
 
+## Unreleased
+
+### Lower overhead
+
+Culprit now uses less than half the CPU it did: about 2.6% of one core
+instead of 5.6% on the Overview tab, and 3.5% instead of 8% with Thermals
+open. It wakes the CPU about 1,100 times a second instead of 4,100, so
+cores sleep more. Measured on a 32-thread desktop with about 800 processes.
+
+- The latency probes default to 2 probes waking every 2 ms, instead of 4
+  every 1 ms. Every stall of 4 ms or more is still caught; raise the probe
+  count in Settings for more coverage.
+- The flight recorder reads the expensive procfs files less often, and takes
+  an extra sample right after each hitch, so hitch analysis keeps its
+  resolution.
+- Idle processes are re-read every 3 s. Per-thread scans and preemption
+  counts are limited to busy processes unless tasks are waiting for CPUs.
+  This also fixes a bug that kept once-busy processes in the per-thread scan
+  forever.
+- NVIDIA per-process queries run every 3 s, and not at all while the GPU is
+  idle.
+- Refreshing a tab no longer repaints the whole window.
+- With the Thermals tab open, slow Super-I/O sensor chips are read every 10 s
+  instead of every 5 s.
+
 ## 0.1.0 (2026-09-26)
 
 The first release of Culprit, a Linux system monitor built for diagnosis. It
