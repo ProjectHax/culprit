@@ -120,8 +120,9 @@ void LoadIoTab::render(const Frame& f)
     if (s.psi.available)
         text += tr(" · <b>PSI</b> cpu %1% · mem %2% · io %3%").arg(s.psi.cpuSome.avg10).arg(s.psi.memSome.avg10).arg(s.psi.ioSome.avg10);
     summary_->setText(text);
-    summary_->setToolTip(tr("Load average (1, 5, 15 min). Runnable and blocked are averaged at 50 Hz; blocked means "
-                            "uninterruptible sleep (D state), usually waiting on I/O.%1")
+    summary_->setToolTip(tr("Load average (1, 5, 15 min). Runnable and blocked are averaged at 5 Hz while the latency "
+                            "probes run (sampled once per update otherwise); blocked means uninterruptible sleep "
+                            "(D state), usually waiting on I/O.%1")
                              .arg(s.psi.available ? tr(" PSI: share of time tasks stalled (avg10).") : QString()));
 
     std::vector<DataTable::Row> rows;

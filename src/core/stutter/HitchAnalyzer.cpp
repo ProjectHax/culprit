@@ -82,21 +82,21 @@ QString commOf(int pid, const Frame* f)
 
 } // namespace
 
-double HitchAnalyzer::detectPeriod(int64_t t0)
+double HitchAnalyzer::PeriodDetector::add(int64_t t0)
 {
     // A burst of hitches (one bad moment, several late wakeups) is one episode;
     // periodicity is judged on episode starts.
-    if (!history_.empty() && t0 - history_.back() < 300'000'000)
-        return lastPeriod_;
-    history_.push_back(t0);
-    while (history_.size() > 32 || (!history_.empty() && t0 - history_.front() > 600'000'000'000LL))
-        history_.pop_front();
-    lastPeriod_ = 0;
-    if (history_.size() < 5)
+    if (!history.empty() && t0 - history.back() < 300'000'000)
+        return lastPeriod;
+    history.push_back(t0);
+    while (history.size() > 32 || (!history.empty() && t0 - history.front() > 600'000'000'000LL))
+        history.pop_front();
+    lastPeriod = 0;
+    if (history.size() < 5)
         return 0;
     std::vector<double> iv;
-    for (size_t i = history_.size() - 4; i < history_.size(); ++i)
-        iv.push_back(double(history_[i] - history_[i - 1]) / 1e9);
+    for (size_t i = history.size() - 4; i < history.size(); ++i)
+        iv.push_back(double(history[i] - history[i - 1]) / 1e9);
     std::vector<double> sorted = iv;
     std::sort(sorted.begin(), sorted.end());
     const double med = (sorted[1] + sorted[2]) / 2;
@@ -107,11 +107,11 @@ double HitchAnalyzer::detectPeriod(int64_t t0)
     for (double v : iv) {
         const double k = std::round(v / med);
         if (k < 1 || k > 3 || std::fabs(v - k * med) > 0.05 * med + 0.02)
-            return lastPeriod_ = 0;
+            return lastPeriod = 0;
         exact += k == 1;
     }
-    lastPeriod_ = exact >= 3 ? med : 0;
-    return lastPeriod_;
+    lastPeriod = exact >= 3 ? med : 0;
+    return lastPeriod;
 }
 
 Hitch HitchAnalyzer::analyze(const HitchCapture& cap, const Frame* lf, const std::vector<HwmonCollector::BusyInterval>& selfBusy,
@@ -366,7 +366,6 @@ Hitch HitchAnalyzer::analyze(const HitchCapture& cap, const Frame* lf, const std
     uint32_t freqEv = UINT32_MAX;
     double freqBase = 0;
     int nfb = 0;
-    uint64_t gpuReasons = 0;
     for (const FlightSample& f : cap.window) {
         const bool inEv = f.tNs >= evA && f.tNs <= evB;
         const bool inBase = f.tNs >= baseA && f.tNs <= baseB;
@@ -390,8 +389,6 @@ Hitch HitchAnalyzer::analyze(const HitchCapture& cap, const Frame* lf, const std
                 ++nfb;
             }
         }
-        if ((f.valid & FlightSample::kGpu) && f.tNs >= evA - 100'000'000 && f.tNs <= evB + 100'000'000)
-            gpuReasons |= f.gpuReasons;
     }
     if (nb) {
         baseBlocked /= nb;
@@ -430,6 +427,12 @@ Hitch HitchAnalyzer::analyze(const HitchCapture& cap, const Frame* lf, const std
         score[int(HitchClass::Thermal)] += 0.6;
         h.evidence << QObject::tr("CPU %1 clock dropped to %2 (≈%3 before)").arg(cpu).arg(fmt::mhz(freqEv / 1000.0), fmt::mhz(freqBase / nfb / 1000.0));
     }
+    // GPU clock reasons from the engine's last (1 Hz) sample: throttling lasts seconds.
+    uint64_t gpuReasons = 0;
+    if (lf)
+        for (const GpuSample& g : lf->gpus)
+            if (g.reasonsValid)
+                gpuReasons |= g.eventReasons;
     const uint64_t badGpu = gpuReasons & (GpuReason::SwThermal | GpuReason::HwThermal | GpuReason::HwSlowdown | GpuReason::HwPowerBrake);
     if (badGpu) {
         score[int(HitchClass::Gpu)] += 0.7;
@@ -471,7 +474,7 @@ Hitch HitchAnalyzer::analyze(const HitchCapture& cap, const Frame* lf, const std
                                            QObject::tr("no interrupt/softirq spike was visible; Deep trace can identify it")});
     }
     h.suspects = std::move(suspects);
-    h.periodSec = detectPeriod(h.t0Ns);
+    h.periodSec = probePeriod_.add(h.t0Ns);
 
     // Only name a suspect in the one-line summary when the evidence is strong.
     const QString top = !h.suspects.empty() && h.suspects.front().score >= 0.3 ? h.suspects.front().label : QString();
@@ -497,6 +500,201 @@ Hitch HitchAnalyzer::analyze(const HitchCapture& cap, const Frame* lf, const std
     }
     if (h.selfActivity)
         h.summary += QObject::tr(" — during Culprit's own sensor read");
+    return h;
+}
+
+namespace {
+
+// A sample label that puts the thread inside the GPU driver, and on one of the NVIDIA driver's locks.
+bool driverLabel(const QString& l)
+{
+    return l.contains(QLatin1String("/dev/nvidia")) || l.contains(QLatin1String("/dev/dri/")) || l.contains(QLatin1String("os_acquire_")) ||
+           l.contains(QLatin1String("os_cond_acquire_"));
+}
+
+bool lockLabel(const QString& l) { return l.contains(QLatin1String("os_acquire_")) || l.contains(QLatin1String("os_cond_acquire_")); }
+
+} // namespace
+
+Hitch HitchAnalyzer::analyzeStall(const CompositorStall& s, const std::vector<Nvml::BusyInterval>& selfGpu)
+{
+    Hitch h;
+    h.id = nextId_++;
+    h.source = HitchSource::Compositor;
+    h.t0Ns = s.t0Ns;
+    h.t1Ns = s.t1Ns;
+    h.wallMs = QDateTime::currentMSecsSinceEpoch() - (monoNs() - h.t0Ns) / 1'000'000;
+    const double dur = double(s.t1Ns - s.t0Ns) / 1e6;
+    h.maxOvershootMs = dur;
+    h.pid = s.pid;
+    h.tid = s.tid;
+    h.process = s.process;
+    h.thread = s.thread;
+    h.onCpuMs = std::clamp(s.runMs, 0.0, dur);
+    h.runqMs = std::clamp(s.waitMs, 0.0, dur - h.onCpuMs);
+    h.blockedMs = std::max(0.0, dur - h.onCpuMs - h.runqMs);
+    h.runDelayShare = dur > 0 ? h.runqMs / dur : 0;
+    const int samples = std::max(1, s.samples);
+    for (size_t i = 0; i < s.blockedIn.size() && i < 5; ++i)
+        h.blockedIn << QObject::tr("%1 (%2 of samples)").arg(s.blockedIn[i].first, fmt::percent(100.0 * s.blockedIn[i].second / samples, 0));
+
+    const QString who = QStringLiteral("%1 %2").arg(s.process, s.thread);
+    const QString self = fmt::procLabel(s.process, s.pid);
+    const QString top = s.blockedIn.empty() ? QString() : s.blockedIn.front().first;
+    // Another of its threads that sat in the GPU driver for most of the freeze.
+    const ThreadActivity* otherInDriver = nullptr;
+    for (const ThreadActivity& a : s.others)
+        if (driverLabel(a.blockedIn) && a.blockedSamples * 2 >= std::max(1, a.samples)) {
+            otherInDriver = &a;
+            break;
+        }
+
+    if (s.mainThread)
+        h.evidence << QObject::tr("It didn't answer Culprit's Wayland ping for %1: its event loop was stuck.").arg(fmt::ms(dur));
+    std::vector<Suspect> suspects;
+    QString why;
+    if (h.runqMs >= 0.4 * dur) {
+        h.cls = HitchClass::RunQueue;
+        why = QObject::tr("waited for a CPU");
+        h.evidence << QObject::tr("It was runnable but waited %1 for a CPU: other tasks kept the CPUs busy. The latency-probe "
+                                  "hitches at the same time name them.")
+                          .arg(fmt::ms(h.runqMs));
+        suspects.push_back({QStringLiteral("kernel"), QObject::tr("CPU contention"), 0, 0.5,
+                            QObject::tr("%1 waiting for a CPU").arg(fmt::ms(h.runqMs))});
+    } else if (h.onCpuMs >= 0.6 * dur) {
+        if (s.mainThread && s.helperMs >= 0.2 * dur) {
+            h.cls = HitchClass::GarbageCollection;
+            why = QObject::tr("JavaScript garbage collection");
+            h.evidence << QObject::tr("It ran for %1 while its JavaScript helper threads used %2 of CPU time: a garbage-collection pause.")
+                              .arg(fmt::ms(h.onCpuMs), fmt::ms(s.helperMs));
+            suspects.push_back({QStringLiteral("process"), QObject::tr("%1 JavaScript heap").arg(self), s.pid, 0.8,
+                                QObject::tr("extensions and long uptimes make collections longer")});
+        } else {
+            h.cls = HitchClass::Busy;
+            why = QObject::tr("busy running its own code");
+            h.evidence << QObject::tr("It ran on a CPU for %1 of the %2 without getting back to its event loop. A profiler (Sysprof) "
+                                      "shows which code.")
+                              .arg(fmt::ms(h.onCpuMs), fmt::ms(dur));
+            suspects.push_back({QStringLiteral("process"), self, s.pid, 0.7, QObject::tr("on a CPU for %1").arg(fmt::ms(h.onCpuMs))});
+        }
+    } else if (h.blockedMs >= 0.5 * dur && !top.isEmpty()) {
+        if (driverLabel(top)) {
+            h.cls = HitchClass::GpuDriver;
+            why = lockLabel(top) ? QObject::tr("waited for a lock inside the NVIDIA driver") : QObject::tr("blocked inside the GPU driver");
+            suspects.push_back({QStringLiteral("gpu"), QObject::tr("GPU driver"), 0, 0.6, top});
+        } else if (top.startsWith(QLatin1String("futex")) && otherInDriver) {
+            h.cls = HitchClass::GpuDriver;
+            why = QObject::tr("waited for its %1, which was blocked inside the GPU driver").arg(otherInDriver->name);
+            suspects.push_back({QStringLiteral("gpu"), QObject::tr("GPU driver"), 0, 0.6,
+                                QStringLiteral("%1: %2").arg(otherInDriver->name, otherInDriver->blockedIn)});
+        } else if (top.startsWith(QLatin1String("futex")) && s.mainThread && s.helperMs >= 0.3 * dur) {
+            // The collector's parallel phases: the main thread waits while the helpers mark and sweep.
+            h.cls = HitchClass::GarbageCollection;
+            why = QObject::tr("waited for its JavaScript helper threads: garbage collection");
+            h.evidence << QObject::tr("It slept on a lock while its JavaScript helper threads used %1 of CPU time: the garbage "
+                                      "collector's parallel work.")
+                              .arg(fmt::ms(s.helperMs));
+            suspects.push_back({QStringLiteral("process"), QObject::tr("%1 JavaScript heap").arg(self), s.pid, 0.8,
+                                QObject::tr("extensions and long uptimes make collections longer")});
+        } else if (top.startsWith(QLatin1String("futex"))) {
+            h.cls = HitchClass::ThreadWait;
+            why = QObject::tr("waited for another of its threads");
+        } else if (s.compactStalls > 0 || s.allocStalls > 0) {
+            h.cls = HitchClass::Reclaim;
+            why = QObject::tr("stalled in memory reclaim / compaction");
+        } else if (top.startsWith(QLatin1String("kernel, outside a syscall"))) {
+            h.cls = HitchClass::Io;
+            why = QObject::tr("blocked in the kernel, probably on a page fault");
+        } else {
+            h.cls = HitchClass::Unknown;
+            why = QObject::tr("blocked in %1").arg(top);
+        }
+    } else {
+        h.cls = HitchClass::Unknown;
+        why = QObject::tr("partly running, partly blocked");
+    }
+
+    // Other processes' threads in the GPU driver: one that isn't queued on the
+    // lock, and especially one burning kernel time, is probably holding it.
+    QStringList waiting;
+    std::map<int, Suspect> holders;
+    const int me = int(getpid());
+    for (const DriverThread& d : s.driver) {
+        const QString label = d.pid == me ? QObject::tr("Culprit itself") : fmt::procLabel(d.process, d.pid);
+        if (d.waitingForLock && d.kernelMs < 0) {
+            if (!waiting.contains(label))
+                waiting << label;
+            continue;
+        }
+        QStringList ev;
+        if (d.kernelMs >= 0)
+            ev << QObject::tr("thread %1 ran %2 in the kernel during the freeze").arg(d.thread, fmt::ms(d.kernelMs));
+        if (!d.call.isEmpty())
+            ev << QObject::tr("thread %1 was in %2%3").arg(d.thread, d.call, d.wchan.isEmpty() ? QString() : QStringLiteral(" (%1)").arg(d.wchan));
+        const double score = d.kernelMs >= 0 ? std::min(0.9, 0.3 + d.kernelMs / std::max(1.0, dur)) : 0.45;
+        Suspect& su = holders[d.pid];
+        if (score > su.score)
+            su = {d.pid == me ? QStringLiteral("self") : QStringLiteral("process"), label, d.pid, score, ev.join(QStringLiteral("; "))};
+    }
+    for (auto& [pid, su] : holders) {
+        if (h.cls == HitchClass::GpuDriver || h.cls == HitchClass::ThreadWait)
+            suspects.push_back(su);
+        else
+            h.evidence << QObject::tr("%1 was in the GPU driver meanwhile: %2").arg(su.label, su.evidence);
+    }
+    if (!waiting.isEmpty())
+        h.evidence << QObject::tr("Also waiting for the NVIDIA driver's lock: %1").arg(waiting.join(QStringLiteral(", ")));
+
+    // Our own NVML queries hold the same driver lock; one long enough to matter is worth naming.
+    for (const Nvml::BusyInterval& b : selfGpu) {
+        if (b.endNs < s.t0Ns || b.startNs > s.t1Ns || double(b.endNs - b.startNs) / 1e6 < 0.25 * dur)
+            continue;
+        const QString took = fmt::ms(double(b.endNs - b.startNs) / 1e6);
+        const bool couldBlock = h.cls == HitchClass::GpuDriver || h.cls == HitchClass::ThreadWait || h.cls == HitchClass::Unknown;
+        if (couldBlock && b.startNs <= s.t0Ns + 2'000'000) {
+            h.selfActivity = true;
+            h.evidence << QObject::tr("Culprit's own NVIDIA %1 was in the driver when the freeze began and took %2: possibly self-inflicted.")
+                              .arg(QLatin1String(b.what), took);
+            suspects.push_back({QStringLiteral("self"), QObject::tr("Culprit's NVIDIA %1").arg(QLatin1String(b.what)), me, 0.9,
+                                QObject::tr("%1 in the driver").arg(took)});
+        } else {
+            h.evidence << QObject::tr("Culprit's own NVIDIA %1 also spent %2 in the driver during the freeze.").arg(QLatin1String(b.what), took);
+        }
+        break;
+    }
+
+    for (const ThreadActivity& a : s.others) {
+        if (!a.blockedIn.isEmpty() && a.blockedSamples * 2 >= std::max(1, a.samples))
+            h.evidence << QObject::tr("Meanwhile its %1 was blocked in %2.").arg(a.name, a.blockedIn);
+        else if (a.runMs >= 0.3 * dur)
+            h.evidence << QObject::tr("Meanwhile its %1 ran for %2.").arg(a.name, fmt::ms(a.runMs));
+    }
+    if (h.cls != HitchClass::GarbageCollection && s.helperMs >= 0.2 * dur)
+        h.evidence << QObject::tr("Its JavaScript helper threads used %1 of CPU time meanwhile.").arg(fmt::ms(s.helperMs));
+    if (s.compactStalls > 0 || s.allocStalls > 0)
+        h.evidence << QObject::tr("Direct reclaim/compaction happened during the freeze (system-wide): %1 allocation stalls, %2 compaction stalls")
+                          .arg(s.allocStalls)
+                          .arg(s.compactStalls);
+    if (s.majorFaults >= 20)
+        h.evidence << QObject::tr("%1 major page faults system-wide during the freeze").arg(s.majorFaults);
+    if (s.selfLateMs >= std::max(20.0, 0.3 * dur)) {
+        h.global = true;
+        h.evidence << QObject::tr("Culprit's sampling thread was itself delayed %1: the whole system hitched, not just the compositor.")
+                          .arg(fmt::ms(s.selfLateMs));
+        if (h.cls == HitchClass::Unknown) {
+            h.cls = HitchClass::Global;
+            why = QObject::tr("the whole system stalled");
+        }
+    }
+
+    std::sort(suspects.begin(), suspects.end(), [](const Suspect& a, const Suspect& b) { return a.score > b.score; });
+    if (suspects.size() > 6)
+        suspects.resize(6);
+    h.suspects = std::move(suspects);
+    h.periodSec = stallPeriod_.add(h.t0Ns);
+    h.summary = QObject::tr("%1 froze for %2: %3").arg(who, fmt::ms(dur), why);
+    if (h.selfActivity)
+        h.summary += QObject::tr(" — during Culprit's own GPU query");
     return h;
 }
 

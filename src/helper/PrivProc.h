@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace culprit {
 
@@ -15,6 +16,8 @@ class PrivProc {
 public:
     void dstate(int64_t nowNs, std::string& out);
     void pio(int64_t nowNs, std::string& out);
+    // Kernel stacks of the given threads right now (a frozen compositor's).
+    void stacks(uint64_t id, const std::vector<int>& tids, std::string& out);
 
 private:
     std::unordered_map<int, int64_t> dSince_;

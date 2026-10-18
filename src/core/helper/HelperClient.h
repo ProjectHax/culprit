@@ -28,6 +28,7 @@ public:
     QString message() const { return message_; }
 
     void requestWindow(quint64 id, int cpu, qint64 t0Ns, qint64 t1Ns);
+    void requestStacks(quint64 id, const std::vector<int>& tids);   // kernel stacks of these threads, now
     void setFocus(int pid);
 
 signals:

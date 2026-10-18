@@ -9,6 +9,7 @@
 //
 //   stdin:  start <features> [thresh_us=N]   features: sched,irq,softirq,reclaim,block,dstate,pio
 //           stop | window <id> <cpu> <t0_ns> <t1_ns> | focus <pid>|none
+//           stacks <id> <tid>... (at most 32)
 //           sysctl <delayacct|schedstats> <on|off> | quit
 //   stdout: {"t":"hello",...} {"t":"rqlat",...} {"t":"window",...} ... {"t":"bye"}
 
@@ -274,6 +275,18 @@ bool handleCommand(Session& s, std::string_view line, std::string& out, bool& qu
             s.drain(monoNs() + 20'000'000, out);
             s.tracker->window(id, int(cpu), t0, t1, out);
         }
+    } else if (cmd == "stacks") {
+        uint64_t id = 0;
+        std::vector<int> tids;
+        int64_t tid = 0;
+        if (!t.nextInt(id)) {
+            JsonObj("err").str("msg", "stacks: bad arguments").line(out);
+            return false;
+        }
+        while (tids.size() < 32 && t.nextInt(tid))
+            if (tid > 0 && tid < (int64_t(1) << 31))
+                tids.push_back(int(tid));
+        s.priv.stacks(id, tids, out);
     } else if (cmd == "focus") {
         std::string_view arg;
         int64_t pid = 0;

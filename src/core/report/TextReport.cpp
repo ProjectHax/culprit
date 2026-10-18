@@ -43,22 +43,36 @@ QString hitchText(const Hitch& h)
 {
     QString s;
     QTextStream o(&s);
-    o << fmt::wallTime(h.wallMs) << "  " << fmt::ms(h.maxOvershootMs) << " late  [" << hitchClassName(h.cls) << "]"
-      << (h.global ? "  global" : "") << (h.periodSec > 0 ? QStringLiteral("  periodic %1 s").arg(h.periodSec, 0, 'f', 2) : QString())
-      << "\n";
+    const bool stall = h.source == HitchSource::Compositor;
+    o << fmt::wallTime(h.wallMs) << "  " << fmt::ms(h.maxOvershootMs) << (stall ? " frozen  [" : " late  [") << hitchClassName(h.cls) << "]"
+      << (stall ? QStringLiteral("  %1 (%2) %3").arg(h.process).arg(h.pid).arg(h.thread) : QString()) << (h.global ? "  global" : "")
+      << (h.periodSec > 0 ? QStringLiteral("  periodic %1 s").arg(h.periodSec, 0, 'f', 2) : QString()) << "\n";
     if (!h.summary.isEmpty())
         o << "    " << h.summary << "\n";
-    QStringList cpus;
-    for (int c : h.cpus)
-        cpus << QString::number(c);
-    o << "    CPUs: " << cpus.join(QLatin1Char(',')) << "  run-queue share of delay: "
-      << fmt::percent(h.runDelayShare * 100.0, 0) << "\n";
+    if (stall) {
+        o << "    on a CPU " << fmt::ms(h.onCpuMs) << ", waiting for a CPU " << fmt::ms(h.runqMs) << ", asleep "
+          << fmt::ms(h.blockedMs) << "\n";
+        for (const QString& b : h.blockedIn)
+            o << "    slept in: " << b << "\n";
+    } else {
+        QStringList cpus;
+        for (int c : h.cpus)
+            cpus << QString::number(c);
+        o << "    CPUs: " << cpus.join(QLatin1Char(',')) << "  run-queue share of delay: "
+          << fmt::percent(h.runDelayShare * 100.0, 0) << "\n";
+    }
     for (const QString& e : h.evidence)
         o << "    - " << e << "\n";
     for (const Suspect& su : h.suspects)
         o << "    suspect (" << QString::number(su.score, 'f', 2) << "): " << su.label
           << (su.evidence.isEmpty() ? QString() : QStringLiteral(" — ") + su.evidence) << "\n";
-    if (h.deepResolved) {
+    for (const ThreadStack& t : h.stacks) {
+        o << "    kernel stack of " << t.comm << " (" << t.process << ", tid " << t.tid << ", state " << QLatin1Char(t.state)
+          << (t.wchan.isEmpty() ? QString() : QStringLiteral(", in %1").arg(t.wchan)) << "):\n";
+        for (const QString& fr : t.frames)
+            o << "      " << fr << "\n";
+    }
+    if (h.deepResolved && !stall) {
         o << "    deep trace — CPU occupancy during the stall:\n";
         for (const DeepBlocker& b : h.blockers)
             o << "      " << pad(b.kind, 8) << pad(b.name, 24) << (b.pid ? QStringLiteral("pid %1 ").arg(b.pid) : QString())
@@ -95,7 +109,7 @@ QString frameText(const Frame& f, const std::vector<Hitch>& hitches)
       << "  blocked(D) " << y.procsBlocked << "  threads " << y.threadsTotal << "\n";
     if (y.avgRunnable >= 0)
         o << "avg runnable " << QString::number(y.avgRunnable, 'f', 2) << "  avg blocked "
-          << QString::number(y.avgBlocked, 'f', 2) << " (50 Hz)\n";
+          << QString::number(y.avgBlocked, 'f', 2) << " (5 Hz)\n";
     o << "run-queue wait (avg tasks waiting) " << QString::number(y.runDelayTotalPct / 100.0, 'f', 2)
       << "  ctxsw " << fmt::rate(y.ctxtPs) << "  irq " << fmt::rate(y.intrPs) << "  forks " << fmt::rate(y.forksPs) << "\n";
     o << "cpufreq: " << y.policy.driver << " / " << y.policy.governor << "  EPP " << y.policy.epp << "  boost "
@@ -206,6 +220,13 @@ QString frameText(const Frame& f, const std::vector<Hitch>& hitches)
         o << "Latency probes are off.\n";
     if (!f.stutter.error.isEmpty())
         o << f.stutter.error << "\n";
+    if (f.compositor.watching)
+        o << "Compositor " << f.compositor.name << " (" << f.compositor.pid << "): responds in "
+          << (f.compositor.typicalMs >= 0 ? fmt::ms(f.compositor.typicalMs) : QStringLiteral("–")) << ", worst last interval "
+          << (f.compositor.worstMs >= 0 ? fmt::ms(f.compositor.worstMs) : QStringLiteral("–")) << ", " << f.compositor.freezes
+          << " freeze(s) of " << fmt::ms(f.compositor.thresholdMs) << " or more so far\n";
+    else
+        o << "Compositor watch: " << f.compositor.message << "\n";
     if (!hitches.empty()) {
         o << "\n";
         const size_t from = hitches.size() > 12 ? hitches.size() - 12 : 0;

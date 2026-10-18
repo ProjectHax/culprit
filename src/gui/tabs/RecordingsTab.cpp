@@ -236,7 +236,8 @@ void RecordingsTab::showRecording()
         DataTable::Cell cls(hitchClassName(h.cls));
         cls.color = hitchColor(h.cls);
         rows.push_back({t, DataTable::Cell(fmt::ms(h.maxOvershootMs), h.maxOvershootMs), cls,
-                        DataTable::Cell(QString::number(h.worstCpu), h.worstCpu), DataTable::Cell(h.summary)});
+                        DataTable::Cell(h.worstCpu >= 0 ? QString::number(h.worstCpu) : QStringLiteral("–"), h.worstCpu),
+                        DataTable::Cell(h.summary)});
     }
     hitches_->setRows(rows);
     rows.clear();

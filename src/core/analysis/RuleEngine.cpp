@@ -96,6 +96,8 @@ void RuleEngine::noteHitch(const Hitch& h)
     n.overshootMs = h.maxOvershootMs;
     n.cls = h.cls;
     n.periodSec = h.periodSec;
+    if (h.source == HitchSource::Compositor)
+        n.compositor = h.process;
     // Only well-supported suspects count, grouped by name ("sh x24" and "sh (123)" -> "sh").
     if (!h.suspects.empty() && h.suspects.front().score >= 0.3) {
         QString name = h.suspects.front().label;

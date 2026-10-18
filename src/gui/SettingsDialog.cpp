@@ -5,6 +5,7 @@
 
 #include "gui/ThemeManager.h"
 
+#include <QCheckBox>
 #include <QComboBox>
 #include <QDialogButtonBox>
 #include <QDoubleSpinBox>
@@ -60,8 +61,12 @@ SettingsDialog::SettingsDialog(const Settings& s, double detectedTjmax, QWidget*
     titleBar_->addItem(tr("Culprit's own"), int(TitleBarMode::Integrated));
     titleBar_->addItem(tr("System"), int(TitleBarMode::System));
     titleBar_->setToolTip(tr("Automatic uses %1.").arg(autoTb.reason));
+    minimizeToTray_ = new QCheckBox(tr("Minimize to the system tray"));
+    minimizeToTray_->setToolTip(tr("In the tray Culprit keeps watching and logging but draws nothing. Hide to tray (Ctrl+H) "
+                                   "does the same where the desktop doesn't report minimizing (GNOME on Wayland)."));
     f0->addRow(tr("Theme"), theme_);
     f0->addRow(tr("Title bar"), titleBar_);
+    f0->addRow(QString(), minimizeToTray_);
     v->addWidget(appearance);
 
     auto* sampling = new QGroupBox(tr("Sampling"));
@@ -93,6 +98,14 @@ SettingsDialog::SettingsDialog(const Settings& s, double detectedTjmax, QWidget*
     f2->addRow(tr("Hitch threshold (floating)"), floatThr_);
     f2->addRow(tr("Hitch threshold (per-CPU)"), cpuThr_);
     f2->addRow(tr("Hitch threshold (kernel latency)"), rtThr_);
+    compositor_ = new QCheckBox(tr("Watch the Wayland compositor for freezes"));
+    compositor_->setToolTip(tr("Pings the compositor (gnome-shell, KWin, …) and samples its main, KMS and input threads, so a "
+                               "frozen cursor or desktop is caught and explained even when nothing else is delayed."));
+    compositorThr_ = dspin(20, 5000, 10, 0, tr(" ms"));
+    compositorThr_->setToolTip(tr("A thread that stays out of its event loop this long counts as a freeze."));
+    f2->addRow(QString(), compositor_);
+    f2->addRow(tr("Compositor freeze threshold"), compositorThr_);
+    connect(compositor_, &QCheckBox::toggled, compositorThr_, &QWidget::setEnabled);
     v->addWidget(stutter);
 
     auto* rules = new QGroupBox(tr("Diagnosis"));
@@ -141,6 +154,7 @@ void SettingsDialog::load(const Settings& s)
 {
     theme_->setCurrentIndex(theme_->findData(int(s.themeMode)));
     titleBar_->setCurrentIndex(titleBar_->findData(int(s.titleBarMode)));
+    minimizeToTray_->setChecked(s.minimizeToTray);
     interval_->setValue(s.intervalMs);
     hotCount_->setValue(s.hotProcessCount);
     probeMode_->setCurrentIndex(probeMode_->findData(int(s.probeMode)));
@@ -148,6 +162,9 @@ void SettingsDialog::load(const Settings& s)
     floatThr_->setValue(s.floatingThresholdMs);
     cpuThr_->setValue(s.perCpuThresholdMs);
     rtThr_->setValue(s.realtimeThresholdMs);
+    compositor_->setChecked(s.compositorProbe);
+    compositorThr_->setValue(s.compositorThresholdMs);
+    compositorThr_->setEnabled(s.compositorProbe);
     tjmax_->setValue(s.tjmaxC);
     highCpu_->setValue(s.highCpuCores);
     sustain_->setValue(s.highCpuSustainSec);
@@ -162,6 +179,7 @@ Settings SettingsDialog::settings() const
     Settings s = base_;
     s.themeMode = ThemeMode(theme_->currentData().toInt());
     s.titleBarMode = TitleBarMode(titleBar_->currentData().toInt());
+    s.minimizeToTray = minimizeToTray_->isChecked();
     s.intervalMs = interval_->value();
     s.hotProcessCount = hotCount_->value();
     s.probeMode = ProbeMode(probeMode_->currentData().toInt());
@@ -169,6 +187,8 @@ Settings SettingsDialog::settings() const
     s.floatingThresholdMs = floatThr_->value();
     s.perCpuThresholdMs = cpuThr_->value();
     s.realtimeThresholdMs = rtThr_->value();
+    s.compositorProbe = compositor_->isChecked();
+    s.compositorThresholdMs = compositorThr_->value();
     s.tjmaxC = tjmax_->value();
     s.highCpuCores = highCpu_->value();
     s.highCpuSustainSec = sustain_->value();

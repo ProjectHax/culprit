@@ -5,19 +5,63 @@ workflow publishes it when a `v<version>` tag is pushed.
 
 ## Unreleased
 
+### Compositor freezes
+
+A frozen cursor or desktop is now caught and explained, even when nothing
+else on the system was delayed. Culprit pings the Wayland compositor
+(gnome-shell, KWin, …) on a connection of its own and samples its main, KMS
+and input threads (25 times a second, 100 while one may be stuck). Each freeze is listed on the Stutter tab with
+where its time went and why:
+
+- JavaScript garbage collection, or busy in its own code;
+- blocked inside the GPU driver, with the ioctl, the other processes that
+  were in the driver at the time, and the one that used kernel time while
+  the compositor waited (the likely holder of the NVIDIA driver's lock);
+- waiting for another of its threads, and what that thread was doing;
+- waiting for a CPU, or a page fault during memory reclaim.
+
+- Deep trace adds the frozen threads' kernel stacks.
+- Freezes raise a "… froze N times" finding and are saved in recordings, so
+  the background recorder catches freezes that only appear after days of
+  uptime.
+- The Stutter graph shows the compositor's response time next to the probes.
+- Culprit times its own NVIDIA queries, which take the same driver lock, and
+  labels a freeze they may have caused.
+- Turn the watch off or change its 100 ms threshold in Settings.
+- `tools/induce/compositor_freeze.sh` freezes a throwaway headless mutter to
+  try it out.
+
+### System tray
+
+- **Hide to tray** (Ctrl+H), and minimizing where the desktop reports it,
+  puts Culprit in the system tray. There it keeps watching and logging
+  (hitches, compositor freezes, findings, recordings) but draws nothing; the
+  views catch up when you bring it back. The tray icon's tooltip counts what
+  was caught meanwhile.
+- In the tray the engine samples every 2 s and NVIDIA per-process queries
+  run every 10 s: about 0.6% of one core and 40 wakeups a second with the
+  latency probes off.
+- `culprit --tray` starts in the tray. *Minimize to the system tray* in
+  Settings → Appearance (on by default).
+- On GNOME the tray comes from the AppIndicator extension.
+
 ### Lower overhead
 
-Culprit now uses less than half the CPU it did: about 2.6% of one core
-instead of 5.6% on the Overview tab, and 3.5% instead of 8% with Thermals
-open. It wakes the CPU about 1,100 times a second instead of 4,100, so
-cores sleep more. Measured on a 32-thread desktop with about 800 processes.
+Culprit now uses well under half the CPU it did: about 1.2% of one core
+with the window open and the latency probes off, 2.1% with them on (it was
+5.6% before this release), and 0.6% in the tray. With the probes off it
+wakes the CPU about 80 times a second instead of 4,100, so cores sleep more.
+Measured on a 32-thread desktop with about 900 processes.
 
+- The flight recorder only runs while the latency probes do, at 25 Hz
+  instead of 50, reading its counters 5 times a second. It no longer calls
+  NVML 10 times a second: those calls take the NVIDIA driver's lock, which
+  the compositor needs too. Hitch analysis uses the engine's GPU sample.
+  It takes an extra sample right after each hitch, so hitch analysis keeps
+  its resolution.
 - The latency probes default to 2 probes waking every 2 ms, instead of 4
   every 1 ms. Every stall of 4 ms or more is still caught; raise the probe
   count in Settings for more coverage.
-- The flight recorder reads the expensive procfs files less often, and takes
-  an extra sample right after each hitch, so hitch analysis keeps its
-  resolution.
 - Idle processes are re-read every 3 s. Per-thread scans and preemption
   counts are limited to busy processes unless tasks are waiting for CPUs.
   This also fixes a bug that kept once-busy processes in the per-thread scan

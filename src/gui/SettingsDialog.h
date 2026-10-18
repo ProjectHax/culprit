@@ -6,6 +6,7 @@
 #include "core/Settings.h"
 #include "gui/widgets/WindowChrome.h"
 
+class QCheckBox;
 class QComboBox;
 class QDoubleSpinBox;
 class QLineEdit;
@@ -25,6 +26,7 @@ private:
     Settings base_;
     QComboBox* theme_;
     QComboBox* titleBar_;
+    QCheckBox* minimizeToTray_;
     QSpinBox* interval_;
     QSpinBox* hotCount_;
     QComboBox* probeMode_;
@@ -32,6 +34,8 @@ private:
     QDoubleSpinBox* floatThr_;
     QDoubleSpinBox* cpuThr_;
     QDoubleSpinBox* rtThr_;
+    QCheckBox* compositor_;
+    QDoubleSpinBox* compositorThr_;
     QDoubleSpinBox* tjmax_;
     QDoubleSpinBox* highCpu_;
     QSpinBox* sustain_;

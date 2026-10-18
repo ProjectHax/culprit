@@ -38,6 +38,10 @@ QString hitchClassKey(HitchClass c)
     case HitchClass::Gpu: return QStringLiteral("gpu");
     case HitchClass::CgroupThrottle: return QStringLiteral("cgroup");
     case HitchClass::Global: return QStringLiteral("global");
+    case HitchClass::GpuDriver: return QStringLiteral("gpu_driver");
+    case HitchClass::Busy: return QStringLiteral("busy");
+    case HitchClass::GarbageCollection: return QStringLiteral("gc");
+    case HitchClass::ThreadWait: return QStringLiteral("thread_wait");
     case HitchClass::Unknown: return QStringLiteral("unknown");
     }
     return QStringLiteral("unknown");
@@ -137,8 +141,30 @@ QJsonObject toJson(const Hitch& h)
                   {QStringLiteral("suspects"), sus},
                   {QStringLiteral("period"), h.periodSec},
                   {QStringLiteral("self"), h.selfActivity}};
-    if (h.deepResolved)
+    if (h.deepResolved && h.source == HitchSource::Probe)
         o.insert(QStringLiteral("blockers"), blockers);
+    if (h.source == HitchSource::Compositor) {
+        QJsonArray stacks;
+        for (const ThreadStack& t : h.stacks)
+            stacks.append(QJsonObject{{QStringLiteral("pid"), t.pid},
+                                      {QStringLiteral("tid"), t.tid},
+                                      {QStringLiteral("comm"), t.comm},
+                                      {QStringLiteral("process"), t.process},
+                                      {QStringLiteral("state"), QString(QLatin1Char(t.state))},
+                                      {QStringLiteral("wchan"), t.wchan},
+                                      {QStringLiteral("frames"), strings(t.frames)}});
+        o.insert(QStringLiteral("source"), QStringLiteral("compositor"));
+        o.insert(QStringLiteral("pid"), h.pid);
+        o.insert(QStringLiteral("tid"), h.tid);
+        o.insert(QStringLiteral("process"), h.process);
+        o.insert(QStringLiteral("thread"), h.thread);
+        o.insert(QStringLiteral("onCpuMs"), h.onCpuMs);
+        o.insert(QStringLiteral("runqMs"), h.runqMs);
+        o.insert(QStringLiteral("blockedMs"), h.blockedMs);
+        o.insert(QStringLiteral("blockedIn"), strings(h.blockedIn));
+        if (!h.stacks.empty())
+            o.insert(QStringLiteral("stacks"), stacks);
+    }
     return o;
 }
 
@@ -163,6 +189,26 @@ Hitch hitchFromJson(const QJsonObject& o)
         h.suspects.push_back(suspectFromJson(v.toObject()));
     h.periodSec = o.value(QStringLiteral("period")).toDouble();
     h.selfActivity = o.value(QStringLiteral("self")).toBool();
+    if (o.value(QStringLiteral("source")).toString() == QLatin1String("compositor")) {
+        h.source = HitchSource::Compositor;
+        h.pid = o.value(QStringLiteral("pid")).toInt();
+        h.tid = o.value(QStringLiteral("tid")).toInt();
+        h.process = o.value(QStringLiteral("process")).toString();
+        h.thread = o.value(QStringLiteral("thread")).toString();
+        h.onCpuMs = o.value(QStringLiteral("onCpuMs")).toDouble();
+        h.runqMs = o.value(QStringLiteral("runqMs")).toDouble();
+        h.blockedMs = o.value(QStringLiteral("blockedMs")).toDouble();
+        h.blockedIn = stringList(o.value(QStringLiteral("blockedIn")));
+        for (const QJsonValue& v : o.value(QStringLiteral("stacks")).toArray()) {
+            const QJsonObject t = v.toObject();
+            const QString state = t.value(QStringLiteral("state")).toString();
+            h.stacks.push_back({t.value(QStringLiteral("pid")).toInt(), t.value(QStringLiteral("tid")).toInt(),
+                                t.value(QStringLiteral("comm")).toString(), t.value(QStringLiteral("process")).toString(),
+                                state.isEmpty() ? '?' : state.at(0).toLatin1(), t.value(QStringLiteral("wchan")).toString(),
+                                stringList(t.value(QStringLiteral("frames")))});
+        }
+        h.deepResolved = !h.stacks.empty();
+    }
     if (o.contains(QStringLiteral("blockers"))) {
         h.deepResolved = true;
         for (const QJsonValue& v : o.value(QStringLiteral("blockers")).toArray()) {

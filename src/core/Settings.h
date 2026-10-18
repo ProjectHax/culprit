@@ -17,6 +17,7 @@ struct Settings {
     // Appearance
     ThemeMode themeMode = ThemeMode::Auto;
     TitleBarMode titleBarMode = TitleBarMode::Auto;
+    bool minimizeToTray = true;      // minimizing hides the window to the system tray
 
     // Sampling
     int intervalMs = 1000;           // engine frame interval
@@ -28,6 +29,8 @@ struct Settings {
     double floatingThresholdMs = 2.0;
     double perCpuThresholdMs = 4.0;   // > EEVDF base slice (~3 ms): normal fair-share waits aren't hitches
     double realtimeThresholdMs = 0.5;
+    bool compositorProbe = true;     // watch the Wayland compositor for freezes
+    double compositorThresholdMs = 100;
 
     // Thermal
     double tjmaxC = 0;               // 0 = auto-detect from CPU model

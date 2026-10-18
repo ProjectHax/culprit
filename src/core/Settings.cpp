@@ -25,6 +25,7 @@ Settings Settings::load()
     Settings s;
     s.themeMode = ThemeMode(qBound(0, q.value("appearance/theme", int(s.themeMode)).toInt(), 2));
     s.titleBarMode = TitleBarMode(qBound(0, q.value("appearance/titleBar", int(s.titleBarMode)).toInt(), 2));
+    s.minimizeToTray = q.value("appearance/minimizeToTray", s.minimizeToTray).toBool();
     s.intervalMs = qBound(250, q.value("sampling/intervalMs", s.intervalMs).toInt(), 10000);
     s.hotProcessCount = qBound(5, q.value("sampling/hotProcessCount", s.hotProcessCount).toInt(), 200);
     s.probeMode = ProbeMode(qBound(0, q.value("stutter/probeMode", int(s.probeMode)).toInt(), 3));
@@ -32,6 +33,8 @@ Settings Settings::load()
     s.floatingThresholdMs = q.value("stutter/floatingThresholdMs", s.floatingThresholdMs).toDouble();
     s.perCpuThresholdMs = q.value("stutter/perCpuThresholdMs", s.perCpuThresholdMs).toDouble();
     s.realtimeThresholdMs = q.value("stutter/realtimeThresholdMs", s.realtimeThresholdMs).toDouble();
+    s.compositorProbe = q.value("stutter/compositorProbe", s.compositorProbe).toBool();
+    s.compositorThresholdMs = qBound(20.0, q.value("stutter/compositorThresholdMs", s.compositorThresholdMs).toDouble(), 5000.0);
     s.tjmaxC = q.value("thermal/tjmaxC", s.tjmaxC).toDouble();
     s.highCpuCores = q.value("rules/highCpuCores", s.highCpuCores).toDouble();
     s.highCpuSustainSec = q.value("rules/highCpuSustainSec", s.highCpuSustainSec).toInt();
@@ -47,6 +50,7 @@ void Settings::save() const
     QSettings q(QStringLiteral("culprit"), QStringLiteral("culprit"));
     q.setValue("appearance/theme", int(themeMode));
     q.setValue("appearance/titleBar", int(titleBarMode));
+    q.setValue("appearance/minimizeToTray", minimizeToTray);
     q.setValue("sampling/intervalMs", intervalMs);
     q.setValue("sampling/hotProcessCount", hotProcessCount);
     q.setValue("stutter/probeMode", int(probeMode));
@@ -54,6 +58,8 @@ void Settings::save() const
     q.setValue("stutter/floatingThresholdMs", floatingThresholdMs);
     q.setValue("stutter/perCpuThresholdMs", perCpuThresholdMs);
     q.setValue("stutter/realtimeThresholdMs", realtimeThresholdMs);
+    q.setValue("stutter/compositorProbe", compositorProbe);
+    q.setValue("stutter/compositorThresholdMs", compositorThresholdMs);
     q.setValue("thermal/tjmaxC", tjmaxC);
     q.setValue("rules/highCpuCores", highCpuCores);
     q.setValue("rules/highCpuSustainSec", highCpuSustainSec);

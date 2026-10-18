@@ -42,6 +42,7 @@ lines) for an explanation of what it measures.
 | *Who is using the CPU, and who suffers?* | Per-process CPU plus **run-queue wait**, i.e. time spent runnable but waiting for a CPU, from per-thread schedstat. Oversubscription is reported with the causes (the biggest consumers) and the victims (the most-delayed processes). Single-CPU hotspots from pinning or affinity are reported separately. |
 | *What is heating the machine?* | CPU package power (RAPL) above the idle floor is split across processes by CPU time × core frequency. GPU power above idle is split by per-process GPU utilization (NVML). It also reports thermal limits, clock drops, NVIDIA throttle reasons and fans that stopped while hot. |
 | *Why does it micro-stutter?* | Latency probes measure how late a sleeping thread wakes up, and how much of that delay it spent on a run queue. Every hitch is analyzed against a 50 Hz "flight recorder" of per-CPU counters and classified: CPU contention (who ran), a late wakeup (IRQ/softirq storms, non-preemptible kernel work, firmware), direct reclaim/compaction, system-wide stalls, fork bursts or thermal throttling. Periodic stutter ("every 2.02 s") is detected too. |
+| *Why does the cursor or the whole desktop freeze?* | The compositor watch pings the Wayland compositor (gnome-shell, KWin, …) on a connection of its own and samples its main, KMS and input threads (25 Hz, 100 Hz while one may be stuck). A freeze is a stretch in which one of them stays out of its event loop. Each is explained from what that thread did: JavaScript garbage collection, busy in its own code, blocked inside the GPU driver (naming the other processes that were in the driver, and the one burning kernel time while holding its lock), waiting for another of its threads, CPU contention, or page faults during reclaim. Deep trace adds the frozen thread's kernel stack. |
 | *…exactly which task/IRQ held the CPU?* | **Deep trace**, a root helper started through polkit, traces `sched_switch`, `sched_waking`, IRQs, softirqs, reclaim, compaction and block I/O. It reports each hitch's exact occupancy: "held CPU 7 for 4.1 ms: `kworker/7:1`, `IRQ 120 nvidia` 0.3 ms". |
 
 Findings are listed with evidence, ranked suspects and advice. A finding
@@ -127,7 +128,7 @@ texts from Qt's sources.
 | **Processes** | Tree or flat view with CPU, run-queue wait, preemptions/s, major faults/s, memory, GPU, estimated watts, I/O, state and systemd unit. Selecting a process shows its details and threads. The context menu offers terminate/kill/stop/continue, nice, I/O priority and CPU affinity (applied to every thread, with a pkexec retry when permission is denied) and *Diagnose stutter for this process*. |
 | **Thermals & Power** | Per-core heatmap (utilization, GHz, run-queue contention, IRQ share), frequency policy, all hwmon sensors with session min/max, CPU/GPU temperature and power graphs, GPU clock limiters, and the heat-contributors table. |
 | **Load & I/O** | Load composition, and tables for per-CPU load, blocked (D) threads with wait channel and kernel stack, disks (utilization, IOPS, await), interrupts, softirqs, cgroup CPU-quota and memory.high throttling, and network. |
-| **Stutter** | Live probe-latency graph with the threshold, the hitch list with a per-hitch explanation, probe mode, threshold and window, the Deep trace toggle (run-queue waiters and a kernel event log), and a focus-process line. |
+| **Stutter** | Live probe-latency graph with the threshold and the compositor's response time, the hitch list (probe hitches and compositor freezes) with a per-hitch explanation, probe mode, threshold and window, the Deep trace toggle (run-queue waiters and a kernel event log), the compositor watch's status, and a focus-process line. |
 | **Recordings** | Open recordings, replay them on a timeline with hitches and findings, and export text or JSON reports. |
 
 | Processes | Thermals & Power |
@@ -139,6 +140,7 @@ texts from Qt's sources.
 | Pause (freezes the display and sampling) | Space |
 | Record | Ctrl+R |
 | Export report… | Ctrl+E |
+| Hide to tray (keeps watching and logging, draws nothing) | Ctrl+H |
 | Settings… | Ctrl+, |
 | About (version, copyright, licenses) | |
 
@@ -163,6 +165,7 @@ create a window, so they work over SSH.
 | *(none)* | Start the GUI. |
 | `--version` | Print the version and copyright. |
 | `--tab NAME` | Start on a tab: `overview`, `processes`, `thermals`, `load`, `stutter` or `recordings`. |
+| `--tray` | Start hidden in the system tray (shows the window instead if no tray is available). |
 | `--probe-mode MODE` | Stutter probes for this run: `off`, `floating`, `percpu` or `rt`. |
 | `--snapshot [--seconds N] [--json]` | Sample for N seconds (default 3), print a diagnosis and exit. |
 | `--record [--out DIR] [--duration S] [--deep]` | Record in the background until Ctrl+C / SIGTERM, or for S seconds. `--deep` also runs the root helper (via pkexec unless already root). |
@@ -179,11 +182,13 @@ Settings are stored in `~/.config/culprit/culprit.conf` and edited under
 |---|---|---|
 | Appearance | Theme: Automatic, Light or Dark | Automatic |
 | | Title bar: Automatic, Culprit's own or System | Automatic |
+| | Minimize to the system tray | on |
 | Sampling | Update interval | 1000 ms |
 | | Processes scanned per thread (the busiest processes get exact per-thread run-queue wait) | 40 |
 | Stutter detection | Probe mode | Floating probes |
 | | Floating probes | 2 |
 | | Hitch threshold: floating / per-CPU / kernel latency | 2 / 4 / 0.5 ms |
+| | Watch the Wayland compositor for freezes, and its threshold | on, 100 ms |
 | Diagnosis | CPU temperature limit (Tjmax) | auto-detected from the CPU model |
 | | Report processes using ≥ N cores, sustained for S seconds | 0.9 cores, 10 s |
 | | Warn when the CPU is above | 80 °C |
@@ -245,6 +250,8 @@ helper exits. The helper:
   latency histograms;
 - reads what only root can see: kernel stacks and wait channels of D-state
   threads, and per-process I/O of every user;
+- reads the kernel stacks of the compositor's threads while a freeze is still
+  going;
 - temporarily enables `kernel.task_delayacct` (per-process block-I/O delay).
   The original value is restored on exit, and after a crash or `kill -9` on
   the next start.
@@ -306,13 +313,15 @@ tab, or run `culprit --report FILE`.
      slice; waiting one slice behind a busy task is normal fair scheduling.
    - *Kernel latency (RT)*: SCHED_FIFO probes granted by rtkit, waking every
      1 ms, so only IRQ/kernel/firmware delay remains.
-2. **Flight recorder.** A 10-second ring of per-CPU counters. `/proc/schedstat`,
-   `/proc/stat`, softirqs and vmstat (with runnable/blocked counts and the
-   fork counter) are read 10 times a second, and once more right after a
+2. **Flight recorder.** A 10-second ring of per-CPU counters, kept only while
+   the latency probes run. `/proc/schedstat`, `/proc/stat`, softirqs, vmstat
+   (with runnable/blocked counts and the fork counter), CPU temperature and
+   per-core frequency are read 5 times a second, and once more right after a
    probe reports a hitch, so every stall has a sample shortly before and
-   shortly after it. CPU temperature, per-core frequency and GPU clock
-   reasons are read at 10 Hz, IRQ lines every 400 ms and after each hitch,
-   and the busiest processes' CPU time at 5 Hz.
+   shortly after it. IRQ lines are read every 400 ms and after each hitch,
+   and the busiest processes' CPU time at 5 Hz. GPU clock reasons come from
+   the 1 Hz engine sample: every NVML call takes the NVIDIA driver's lock,
+   which the compositor needs too.
 3. **Analysis.** Each hitch's surrounding window (−600 ms … +200 ms) is
    compared with the baseline before it. The analyzer ranks suspects: who ran
    on the stalled CPU, IRQ lines and softirq vectors above baseline,
@@ -326,6 +335,48 @@ tab, or run `culprit --report FILE`.
 Culprit's own slow sensor reads are recorded. A hitch that coincides with one
 is labelled self-inflicted, and Culprit's own threads are never blamed as
 suspects.
+
+## How compositor freezes are caught
+
+A frozen cursor or desktop is often not the system being slow: one thread of
+the compositor stopped while nothing else was delayed, so the latency probes
+see nothing. The compositor watch looks at the compositor itself,
+unprivileged. It is on by default, with a 100 ms threshold (Settings →
+Stutter detection).
+
+1. **Pings.** Culprit opens a Wayland connection of its own and sends
+   `wl_display.sync` every 40 ms, one at a time. The compositor's main thread
+   answers from its event loop, so an answer that takes longer than the
+   threshold is a freeze of that thread. The ping goes out at the start of a
+   sampling tick and is usually answered (in ~0.05 ms) before the tick ends,
+   so it costs no wakeup of its own. The process on the other end of the
+   socket (`SO_PEERCRED`) is the one watched. `CULPRIT_WAYLAND_DISPLAY` points
+   the watch at another compositor than the one showing Culprit's window.
+2. **Thread samples.** The main thread, the KMS thread (page flips and the
+   cursor) and the input thread are sampled at 25 Hz, and at 100 Hz while a
+   ping is late or one of them is out of its event loop: on-CPU and run-queue
+   time from `/proc/<tid>/schedstat`, and, while they sleep anywhere but their
+   event loop (`poll`/`epoll`), the kernel wait site and the syscall. DRM and
+   NVIDIA ioctls are decoded to the device and request. A KMS or input thread
+   that stays out of its event loop for the threshold is a freeze too, even
+   while the main thread is fine.
+3. **Driver scan.** When a frozen thread sits in the GPU driver or on a lock,
+   Culprit checks every thread of the NVIDIA GPU clients: which are in a
+   driver ioctl, which are queued on the driver's lock (`os_acquire_*`) and,
+   when the freeze ends, which used kernel time meanwhile. A thread in the
+   driver that isn't queued, especially one using kernel time, probably holds
+   the lock.
+4. **Analysis.** Each freeze is classified by where its time went: on a CPU
+   with the JavaScript helper threads busy (garbage collection) or without
+   them (its own code), waiting for a CPU, blocked in the GPU driver, waiting
+   for another of its threads (and what that thread was doing), or a page
+   fault during reclaim. Culprit's own NVML queries take the same driver lock,
+   so a long one that overlaps the start of a freeze is reported as possibly
+   self-inflicted.
+
+Freezes are listed on the Stutter tab next to the probe hitches, raise a
+"… froze N times" finding, and are written to recordings. Run the background
+recorder to catch freezes that only appear after days of uptime.
 
 ## Getting more out of the kernel
 
@@ -351,18 +402,24 @@ suspects.
 
 ## Overhead
 
-Measured on a 16-core / 32-thread desktop (~750 processes, ~3500 threads), as a
-share of one CPU core:
+Measured on a 16-core / 32-thread desktop (~850–1,000 processes, ~3,900
+threads), as a share of one CPU core:
 
-| Component | Cost |
-|---|---|
-| Engine (process scan, per-thread scan of busy processes, sensors, NVML, rules), 1 Hz | ≈0.8 % |
-| Flight recorder | ≈0.9 % |
-| Latency probes (2 at 500 Hz) | ≈0.4 % |
-| GUI (Overview; ≈0.8 % on the Processes tab) | ≈0.5 % |
-| **Total** | **≈2.6 %**, ~1,100 wakeups/s |
+| Component | Window open | In the tray |
+|---|---|---|
+| Engine (process scan, per-thread scan of busy processes, sensors, NVML, rules) | ≈0.7–1 %, every second | ≈0.4 %, every 2 s |
+| Compositor watch (25 Hz thread samples, 25 pings/s) | ≈0.15 % | ≈0.15 % |
+| GUI (Overview; ≈1 % on the Processes tab) | ≈0.3–0.5 % | ≈0 % (draws nothing) |
+| Flight recorder (only while the latency probes run) | ≈0.55 % | ≈0.55 % |
+| Latency probes (2 at 500 Hz, ~1,000 wakeups/s) | ≈0.4 % | ≈0.4 % |
+| **Total, latency probes off** | **≈1.2 %**, ~80 wakeups/s | **≈0.6 %**, ~40 wakeups/s |
+| **Total, latency probes on** | **≈2.1 %**, ~1,100 wakeups/s | **≈1.6 %**, ~1,050 wakeups/s |
 
-Culprit is niced (+5), and it does less while the system is quiet:
+The compositor watch's pings add up to 25 wakeups a second to the
+compositor's main thread.
+
+Culprit is niced (+5), and it does less while the system is quiet or nobody
+is looking:
 
 - Processes that stay idle are re-read every 3 s instead of every second.
   New and busy ones are read every second.
@@ -370,10 +427,16 @@ Culprit is niced (+5), and it does less while the system is quiet:
   core, or more than 1% while tasks are waiting for CPUs. Preemption counts
   need the expensive `/proc/<tid>/status`, so they are only collected under
   contention, or for the process you select.
-- NVIDIA per-process queries (≈2.5 ms each) run every 3 s, and not at all
-  while the GPU is idle.
-- The most expensive procfs files (`/proc/schedstat`, `/proc/interrupts`)
-  are read at 10 Hz and 2.5 Hz, plus once after each hitch.
+- NVIDIA per-process queries (≈1.5 ms of the driver's lock) run every 3 s, or
+  every 10 s in the tray; per-process utilisation is skipped while the GPU is
+  idle.
+- The flight recorder runs only while the latency probes do. It reads the
+  most expensive procfs files (`/proc/schedstat` ≈0.24 ms, `/proc/interrupts`
+  ≈0.55 ms with 32 CPUs) at 5 Hz and 2.5 Hz, plus once after each hitch.
+- In the tray (or minimized, where the desktop reports it) the GUI does no
+  work at all, and the engine samples every 2 s without the per-thread rows
+  that only the Processes tab shows. Hitches, freezes, findings and recordings
+  carry on; the views catch up when the window comes back.
 - Super-I/O sensor chips (nct67xx, it87, …) cost about 70 ms of kernel time
   per refresh. They are polled on a separate thread every 30 s, or every 10 s
   while the Thermals tab is open.
@@ -395,6 +458,7 @@ verify the diagnosis:
 | `mem_high.sh` | "… throttled at its memory.high limit", swapping with the faulting process first |
 | `cpu_quota.sh` | "… throttled by its CPU quota" |
 | `udp_flood.py` | NET_RX softirq load in Load & I/O |
+| `compositor_freeze.sh [MS] [S]` | a throwaway headless mutter is stopped for MS ms every 3 s: "mutter main thread froze for ~MS ms" (watch it with `CULPRIT_WAYLAND_DISPLAY=culprit-induce`) |
 
 ## Limitations
 
@@ -408,6 +472,16 @@ verify the diagnosis:
   be attributed statistically (as fork bursts).
 - Hitch analysis is heuristic evidence ranking. Deep trace provides the
   authoritative answer.
+- The system tray needs a StatusNotifierItem host; on GNOME that is the
+  AppIndicator extension. GNOME turns extensions off while the screen is
+  locked, and Qt looks for a tray only once, so Culprit started while the
+  screen is locked has no tray until it restarts. GNOME on Wayland doesn't
+  tell applications they were minimized: use Hide to tray (Ctrl+H) there.
+- The compositor watch needs a Wayland session and a compositor running as
+  your user. With Yama `ptrace_scope` 1 or higher (Ubuntu's default), the
+  kernel hides other processes' syscalls, so freezes show only the wait site
+  (no ioctl device), and the driver scan sees only threads queued on the
+  NVIDIA lock. The scan covers NVIDIA GPU clients only.
 - The "probably not connected" sensor mark is a heuristic too. A genuinely
   hot board sensor, such as a VRM under sustained heavy load, can be marked.
 
@@ -417,7 +491,7 @@ verify the diagnosis:
 src/common/   pure C++20, shared with the helper: procfs/sysfs parsers, cached fds,
               tracefs format parser, JSON writer, SPSC ring
 src/core/     QtCore: Engine, collectors (system, processes, hwmon, RAPL, NVML, cgroups),
-              stutter (probes, flight recorder, hitch analyzer), analysis (rule engine,
+              stutter (probes, flight recorder, compositor watch, hitch analyzer), analysis (rule engine,
               power attribution), helper client, recorder, reports, process actions, settings
 src/gui/      Qt Widgets: main window, theme, tabs, models, custom QPainter widgets
 src/helper/   culprit-helper: perf_event_open tracer, scheduler/IRQ tracker, privileged /proc

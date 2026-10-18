@@ -13,6 +13,7 @@
 #include "gui/widgets/HeaderFit.h"
 
 #include <QApplication>
+#include <QSystemTrayIcon>
 #include <QIcon>
 #include <QStandardPaths>
 #include <QCommandLineParser>
@@ -63,6 +64,7 @@ void addCommonOptions(QCommandLineParser& p)
     p.addOption({QStringLiteral("probe-mode"), QStringLiteral("Stutter probes: off, floating, percpu or rt."), QStringLiteral("mode")});
     p.addOption({QStringLiteral("grab"), QStringLiteral("Save a PNG screenshot of the window after --seconds, then exit."), QStringLiteral("file.png")});
     p.addOption({QStringLiteral("tab"), QStringLiteral("Tab to show at startup (overview, processes, thermals, load, stutter, recordings)."), QStringLiteral("name")});
+    p.addOption({QStringLiteral("tray"), QStringLiteral("Start hidden in the system tray: keep watching and logging, draw nothing.")});
 }
 
 void applyProbeOption(const QCommandLineParser& parser, culprit::Settings& s)
@@ -215,6 +217,7 @@ int main(int argc, char** argv)
         QGuiApplication::setDesktopFileName(QStringLiteral("culprit"));
 
     QApplication app(argc, argv);
+    QApplication::setQuitOnLastWindowClosed(false);   // closing the main window quits (MainWindow::closeEvent)
     setAppInfo();
     QApplication::setApplicationDisplayName(QString::fromLatin1(culprit::kAppName));
     QApplication::setWindowIcon(QIcon::fromTheme(QStringLiteral("culprit"), QIcon(QStringLiteral(":/culprit.svg"))));
@@ -229,7 +232,10 @@ int main(int argc, char** argv)
         w.showTab(parser.value(QStringLiteral("tab")));
     if (parser.isSet(QStringLiteral("open")))
         w.openRecording(parser.value(QStringLiteral("open")));
-    w.show();
+    if (parser.isSet(QStringLiteral("tray")) && QSystemTrayIcon::isSystemTrayAvailable())
+        w.hideToTray();
+    else
+        w.show();
 
     if (parser.isSet(QStringLiteral("grab"))) {
         const QString file = parser.value(QStringLiteral("grab"));

@@ -15,6 +15,7 @@
 #include "core/collect/ProcessCollector.h"
 #include "core/collect/SystemCollector.h"
 #include "core/helper/HelperClient.h"
+#include "core/stutter/CompositorProbe.h"
 #include "core/stutter/FlightRecorder.h"
 #include "core/stutter/HitchAnalyzer.h"
 
@@ -30,7 +31,10 @@
 
 namespace culprit {
 
-Engine::Engine(const Settings& settings) : settings_(settings), feed_(std::make_shared<LatencyFeed>()) {}
+Engine::Engine(const Settings& settings)
+    : settings_(settings), feed_(std::make_shared<LatencyFeed>()), compositorFeed_(std::make_shared<LatencyFeed>())
+{
+}
 
 Engine::~Engine() = default;
 
@@ -61,6 +65,15 @@ void Engine::start()
         QMetaObject::invokeMethod(this, [this, cap] { onCapture(cap); }, Qt::QueuedConnection);
     });
     startProbes();
+    compositor_ = std::make_unique<CompositorProbe>(
+        compositorFeed_,
+        [this](std::shared_ptr<CompositorStall> s) {
+            QMetaObject::invokeMethod(this, [this, s] { onCompositorStall(*s); }, Qt::QueuedConnection);
+        },
+        [this](uint64_t seq, std::vector<int> tids) {
+            QMetaObject::invokeMethod(this, [this, seq, tids] { onCompositorOngoing(seq, tids); }, Qt::QueuedConnection);
+        });
+    startCompositorProbe();
 
     helper_ = new HelperClient(this);
     connect(helper_, &HelperClient::received, this, &Engine::onHelperEvent);
@@ -69,6 +82,9 @@ void Engine::start()
         helperStatus_.message = msg;
         if (st != HelperStatus::State::Running) {
             awaitingWindow_.clear();
+            stallStacks_.clear();
+            awaitingStacks_.clear();
+            stacksRequested_.clear();
             helperDState_.clear();
             helperIo_.clear();
             deepLatest_ = {};
@@ -80,7 +96,7 @@ void Engine::start()
     timer_ = new QTimer(this);
     timer_->setTimerType(Qt::PreciseTimer);
     connect(timer_, &QTimer::timeout, this, &Engine::tick);
-    timer_->start(settings_.intervalMs);
+    timer_->start(intervalMs());
     tick();   // prime the delta counters
 }
 
@@ -117,10 +133,44 @@ void Engine::onCapture(const std::shared_ptr<HitchCapture>& cap)
     }
 }
 
+void Engine::startCompositorProbe()
+{
+    if (settings_.compositorProbe)
+        compositor_->start(settings_.compositorThresholdMs);
+    else
+        compositor_->stop();
+}
+
+void Engine::onCompositorOngoing(uint64_t seq, const std::vector<int>& tids)
+{
+    // Still frozen: the root helper can read where in the kernel these threads are stuck.
+    if (!helper_ || helper_->state() != HelperStatus::State::Running)
+        return;
+    helper_->requestStacks(seq, tids);
+    stacksRequested_.insert(seq);
+}
+
+void Engine::onCompositorStall(const CompositorStall& s)
+{
+    Hitch h = analyzer_->analyzeStall(s, Nvml::instance().ok() ? Nvml::instance().busyIntervals(s.t0Ns - 1'000'000'000) : std::vector<Nvml::BusyInterval>{});
+    if (auto it = stallStacks_.find(s.seq); it != stallStacks_.end()) {
+        h.stacks = std::move(it->second);
+        h.deepResolved = true;
+        stallStacks_.erase(it);
+    } else if (stacksRequested_.count(s.seq)) {
+        awaitingStacks_[s.seq] = h;   // the helper hasn't answered yet
+    }
+    stacksRequested_.erase(s.seq);
+    rules_->noteHitch(h);
+    emit hitchDetected(h);
+}
+
 void Engine::stop()
 {
     if (timer_)
         timer_->stop();
+    if (compositor_)
+        compositor_->stop();
     delete helper_;   // tells the root helper to quit (it also exits on stdin EOF)
     helper_ = nullptr;
     if (flight_)
@@ -136,6 +186,7 @@ void Engine::applySettings(const Settings& s)
                                    s.floatingThresholdMs != settings_.floatingThresholdMs ||
                                    s.perCpuThresholdMs != settings_.perCpuThresholdMs ||
                                    s.realtimeThresholdMs != settings_.realtimeThresholdMs;
+        const bool compositorChanged = s.compositorProbe != settings_.compositorProbe || s.compositorThresholdMs != settings_.compositorThresholdMs;
         settings_ = s;
         if (rules_)
             rules_->setSettings(s);
@@ -143,8 +194,28 @@ void Engine::applySettings(const Settings& s)
             flight_->stop();
             startProbes();
         }
+        if (compositorChanged && compositor_)
+            startCompositorProbe();
         if (timer_)
-            timer_->setInterval(s.intervalMs);
+            timer_->setInterval(intervalMs());
+    }, Qt::QueuedConnection);
+}
+
+int Engine::intervalMs() const
+{
+    // Hidden, nobody watches the numbers: findings and recordings are fine with a 2 s pace,
+    // and the probes and the compositor watch don't depend on it.
+    return background_ ? std::max(settings_.intervalMs, 2000) : settings_.intervalMs;
+}
+
+void Engine::setBackground(bool on)
+{
+    QMetaObject::invokeMethod(this, [this, on] {
+        background_ = on;
+        if (timer_)
+            timer_->setInterval(intervalMs());
+        if (gpu_)
+            gpu_->setProcRefreshNs(on ? 10'000'000'000LL : 3'000'000'000LL);
     }, Qt::QueuedConnection);
 }
 
@@ -272,6 +343,34 @@ void Engine::onHelperEvent(const QJsonObject& ev)
         deepEvents_.push_back(d);
         if (deepEvents_.size() > 500)
             deepEvents_.erase(deepEvents_.begin(), deepEvents_.begin() + 100);
+    } else if (t == QLatin1String("stacks")) {
+        const uint64_t seq = quint64(num("id"));
+        std::vector<ThreadStack> stacks;
+        for (const QJsonValue& v : ev.value(QStringLiteral("rows")).toArray()) {
+            const QJsonObject o = v.toObject();
+            ThreadStack ts;
+            ts.pid = o.value(QStringLiteral("pid")).toInt();
+            ts.tid = o.value(QStringLiteral("tid")).toInt();
+            ts.comm = o.value(QStringLiteral("comm")).toString();
+            ts.process = o.value(QStringLiteral("proc")).toString();
+            const QString state = o.value(QStringLiteral("state")).toString();
+            ts.state = state.isEmpty() ? '?' : state.at(0).toLatin1();
+            ts.wchan = o.value(QStringLiteral("wchan")).toString();
+            for (const QJsonValue& fr : o.value(QStringLiteral("stack")).toArray())
+                ts.frames << fr.toString();
+            stacks.push_back(ts);
+        }
+        if (auto it = awaitingStacks_.find(seq); it != awaitingStacks_.end()) {
+            Hitch h = std::move(it->second);
+            awaitingStacks_.erase(it);
+            h.stacks = std::move(stacks);
+            h.deepResolved = true;
+            emit hitchUpdated(h);
+        } else if (stacksRequested_.count(seq)) {
+            stallStacks_[seq] = std::move(stacks);
+            while (stallStacks_.size() > 16)
+                stallStacks_.erase(stallStacks_.begin());
+        }
     } else if (t == QLatin1String("rqtop")) {
         deepLatest_.topWaiters.clear();
         for (const QJsonValue& v : ev.value(QStringLiteral("rows")).toArray()) {
@@ -407,7 +506,8 @@ void Engine::tick()
     const int64_t tpStart = monoNs();
     ProcessCollector::Config pc;
     pc.hotCount = settings_.hotProcessCount;
-    pc.detailPids = detailPids_;
+    if (!background_)   // per-thread rows only feed the Processes tab
+        pc.detailPids = detailPids_;
     pc.focusPid = focusPid_;
     if (focusPid_ > 0)
         pc.detailPids.insert(focusPid_);   // per-thread rows for the focus panel
@@ -428,6 +528,13 @@ void Engine::tick()
     power_->sample(frame->power, t0);
     const int64_t tg = monoNs();
     gpu_->sample(*frame);
+    std::vector<int> gpuClients;
+    for (const GpuSample& g : frame->gpus)
+        for (const GpuProc& p : g.procs)
+            gpuClients.push_back(p.pid);
+    if (!gpuClients.empty())
+        compositor_->setGpuClients(std::move(gpuClients));
+    compositor_->summary(frame->compositor);
     attributeCpuPower(*frame);
     mergeHelperData(*frame);
     const int64_t tr = monoNs();

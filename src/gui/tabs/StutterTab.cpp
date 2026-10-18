@@ -28,8 +28,9 @@
 
 namespace culprit {
 
-StutterTab::StutterTab(std::shared_ptr<LatencyFeed> feed, const Settings& settings, QWidget* parent)
-    : TabPage(parent), feed_(std::move(feed)), settings_(settings)
+StutterTab::StutterTab(std::shared_ptr<LatencyFeed> feed, std::shared_ptr<LatencyFeed> compositorFeed, const Settings& settings,
+                       QWidget* parent)
+    : TabPage(parent), feed_(std::move(feed)), compositorFeed_(std::move(compositorFeed)), settings_(settings)
 {
     auto* v = new QVBoxLayout(this);
     v->setContentsMargins(6, 6, 6, 6);
@@ -77,12 +78,23 @@ StutterTab::StutterTab(std::shared_ptr<LatencyFeed> feed, const Settings& settin
     deepStatus_->setWordWrap(true);
     deepStatus_->hide();
     v->addWidget(deepStatus_);
+    compositorStatus_ = new QLabel;
+    compositorStatus_->setWordWrap(true);
+    compositorStatus_->setTextFormat(Qt::RichText);
+    compositorStatus_->setToolTip(tr("Culprit pings the Wayland compositor (wl_display.sync) and samples its main, KMS and input "
+                                     "threads. A freeze is a stretch in which a thread didn't get back to its event loop: "
+                                     "the cursor, animations or input stop. Each freeze is listed below with what the thread "
+                                     "was doing. Threshold and on/off in Settings."));
+    v->addWidget(compositorStatus_);
 
     graph_ = new TimelineView;
-    graph_->setSeries({{tr("wakeup delay"), theme::blue(), true, false, {}}});
+    graph_->setSeries({{tr("wakeup delay"), theme::blue(), true, false, {}},
+                       {tr("compositor response (right axis)"), theme::orange(), false, true, {}}});
     graph_->setYUnit(tr("ms"));
+    graph_->setRightUnit(tr("ms"));
     graph_->setYRange(0, 3, true);
-    graph_->setEmptyText(tr("Latency probes are off."));
+    graph_->setRightYRange(0, 20, true);
+    graph_->setEmptyText(tr("Latency probes and the compositor watch are off."));
     graph_->setMinimumHeight(200);
 
     auto* split = new QSplitter(Qt::Vertical);
@@ -230,8 +242,11 @@ void StutterTab::addHitch(const Hitch& h)
     // Only record here; the view catches up on the (throttled) refresh timer,
     // so a burst of hitches can't make the GUI itself a source of stutter.
     hitches_.push_back(h);
-    while (hitches_.size() > 500)
-        hitches_.pop_front();
+    // Over hours in the tray, frequent probe hitches must not push out the rare compositor freezes.
+    while (hitches_.size() > 1000) {
+        const auto probe = std::find_if(hitches_.begin(), hitches_.end(), [](const Hitch& x) { return x.source == HitchSource::Probe; });
+        hitches_.erase(probe != hitches_.end() ? probe : hitches_.begin());
+    }
     tableDirty_ = true;
 }
 
@@ -258,7 +273,8 @@ void StutterTab::rebuildTable()
         if (h.periodSec > 0)
             expl += tr("  [every %1 s]").arg(h.periodSec, 0, 'f', 2);
         rows.push_back({time, DataTable::Cell(fmt::ms(h.maxOvershootMs), h.maxOvershootMs, h.maxOvershootMs >= 16 ? theme::red() : QColor()),
-                        cls, DataTable::Cell(QString::number(h.worstCpu), h.worstCpu), DataTable::Cell(expl)});
+                        cls, DataTable::Cell(h.worstCpu >= 0 ? QString::number(h.worstCpu) : QStringLiteral("–"), h.worstCpu),
+                        DataTable::Cell(expl)});
     }
     table_->setRows(rows);
 }
@@ -294,6 +310,12 @@ void StutterTab::refreshGraph()
         lat.emplace_back(double(p.tNs - now) / 1e9, p.maxUs / 1000.0);
     graph_->setXRange(-windowSec, 0);
     graph_->setPoints(0, std::move(lat));
+    compositorFeed_->copySince(now - int64_t(windowSec) * 1'000'000'000, pts);
+    std::vector<QPointF> comp;
+    comp.reserve(pts.size());
+    for (const auto& p : pts)
+        comp.emplace_back(double(p.tNs - now) / 1e9, p.maxUs / 1000.0);
+    graph_->setPoints(1, std::move(comp));
     const double thr = feed_->thresholdMs;
     graph_->setThreshold(feed_->probes > 0 ? thr : -1, tr("threshold %1").arg(fmt::ms(thr)));
     std::vector<TimelineView::Marker> markers;
@@ -389,6 +411,18 @@ void StutterTab::render(const Frame& f)
         status_->setText(s.error.isEmpty() ? tr("Probes off") : s.error);
     else
         status_->setText(tr("%1 probes · worst %2 · %3 hitches/min").arg(s.probes).arg(fmt::ms(s.worstMs)).arg(lastMinute));
+    const CompositorSummary& c = f.compositor;
+    if (!c.watching)
+        compositorStatus_->setText(tr("<b>Compositor:</b> %1").arg(c.message.toHtmlEscaped()));
+    else
+        compositorStatus_->setText(tr("<b>Compositor:</b> %1 (%2) · responds in %3 · worst %4 in the last second · "
+                                      "%5 freeze(s) of %6 or more")
+                                       .arg(c.name.toHtmlEscaped())
+                                       .arg(c.pid)
+                                       .arg(c.typicalMs >= 0 ? fmt::ms(c.typicalMs) : QStringLiteral("–"),
+                                            c.worstMs >= 0 ? fmt::ms(c.worstMs) : QStringLiteral("–"))
+                                       .arg(c.freezes)
+                                       .arg(fmt::ms(c.thresholdMs)));
     status_->setToolTip(!s.error.isEmpty() ? s.error
                         : tr("Worst probe wakeup delay in the last second; hitches in the last minute.%1")
                               .arg(s.suppressed ? tr(" %1 hitches were not analysed (rate limit).").arg(s.suppressed) : QString()));

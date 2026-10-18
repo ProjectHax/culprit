@@ -20,21 +20,20 @@
 
 namespace culprit {
 
-// Full counter samples (schedstat, stat, softirqs, vmstat) are taken this often,
-// and again right after a probe reports a hitch, so every stall has one shortly
-// before and one shortly after it.
-inline constexpr int64_t kFlightFullPeriodNs = 100'000'000;
+// Full counter samples (schedstat, stat, softirqs, vmstat, CPU clocks and
+// temperature) are taken this often, and again right after a probe reports a
+// hitch, so every stall has one shortly before and one shortly after it.
+inline constexpr int64_t kFlightFullPeriodNs = 200'000'000;
 
-// One 20 ms tick of cheap system counters. `valid` says which groups were
-// read on this tick (they run at different rates).
+// One 40 ms tick of the flight recorder. `valid` says which groups were read
+// on this tick (they run at different rates).
 struct FlightSample {
-    enum : uint32_t { kSched = 1, kStat = 2, kSoftirq = 4, kVm = 8, kTemp = 16, kIrq = 32, kFreq = 64, kGpu = 128 };
+    enum : uint32_t { kSched = 1, kStat = 2, kSoftirq = 4, kVm = 8, kTemp = 16, kIrq = 32, kFreq = 64 };
     int64_t tNs = 0;
     uint32_t valid = 0;
     uint16_t procsRunning = 0, procsBlocked = 0;
     uint64_t forks = 0;   // /proc/stat "processes" (cumulative)
     float tctl = 0;
-    uint64_t gpuReasons = 0;
     VmStat vm;
     std::vector<uint64_t> runNs, waitNs;                                  // per CPU, /proc/schedstat
     std::vector<uint64_t> busyTicks, irqTicks, softirqTicks, totalTicks;  // per CPU, /proc/stat
@@ -78,7 +77,7 @@ class LatencyFeed {
 public:
     struct Point {
         int64_t tNs = 0;
-        float maxUs = 0;        // worst probe wakeup delay in this 20 ms tick
+        float maxUs = 0;        // worst probe wakeup delay in this tick
         float rqShare = 0;      // share of that delay spent on a run queue
     };
     void push(const Point& p);

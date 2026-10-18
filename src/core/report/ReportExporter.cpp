@@ -52,6 +52,8 @@ struct HitchStats {
     std::map<QString, int> bySuspect;
     double worst = 0;
     std::vector<double> periods;
+    int freezes = 0;           // compositor freezes among the hitches
+    double worstFreeze = 0;
 };
 
 HitchStats statsOf(const std::vector<Hitch>& hs)
@@ -59,7 +61,12 @@ HitchStats statsOf(const std::vector<Hitch>& hs)
     HitchStats st;
     for (const Hitch& h : hs) {
         st.byClass[h.cls]++;
-        st.worst = std::max(st.worst, h.maxOvershootMs);
+        if (h.source == HitchSource::Compositor) {
+            ++st.freezes;
+            st.worstFreeze = std::max(st.worstFreeze, h.maxOvershootMs);
+        } else {
+            st.worst = std::max(st.worst, h.maxOvershootMs);
+        }
         if (!h.suspects.empty() && h.suspects.front().score >= 0.3) {
             QString name = h.suspects.front().label;   // group "sh x24" / "sh (123)" as "sh"
             for (const QString& sep : {QStringLiteral(" \u00d7"), QStringLiteral(" (")})
@@ -194,6 +201,8 @@ QString recordingText(const Recording& r)
     if (dur > 0)
         o << " (" << QString::number(double(r.hitches.size()) / (dur / 60.0), 'f', 1) << " per minute)";
     o << ", worst " << fmt::ms(st.worst) << "\n";
+    if (st.freezes > 0)
+        o << "of which " << st.freezes << " compositor freeze(s), worst " << fmt::ms(st.worstFreeze) << "\n";
     for (const auto& [cls, n] : st.byClass)
         o << "  " << hitchClassName(cls) << ": " << n << "\n";
     if (!st.bySuspect.empty()) {
@@ -255,6 +264,8 @@ QJsonObject recordingJson(const Recording& r)
                        {QStringLiteral("samples"), qint64(r.points.size())},
                        {QStringLiteral("hitchCount"), qint64(r.hitches.size())},
                        {QStringLiteral("worstHitchMs"), st.worst},
+                       {QStringLiteral("compositorFreezes"), st.freezes},
+                       {QStringLiteral("worstFreezeMs"), st.worstFreeze},
                        {QStringLiteral("hitchesByClass"), byClass},
                        {QStringLiteral("findings"), findings},
                        {QStringLiteral("hitches"), hitches}};

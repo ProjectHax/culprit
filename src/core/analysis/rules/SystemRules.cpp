@@ -56,7 +56,7 @@ void stutterRules(const RuleContext& ctx)
     int lastMinute = 0;
     double worst = 0;
     for (const HitchNote& h : hs) {
-        if (now - h.tNs > 60'000'000'000LL)
+        if (now - h.tNs > 60'000'000'000LL || !h.compositor.isEmpty())
             continue;
         ++lastMinute;
         byClass[int(h.cls)]++;
@@ -83,6 +83,66 @@ void stutterRules(const RuleContext& ctx)
                                    QObject::tr("top suspect in %1 hitch(es)").arg(sus[i].first)});
         fi.advice = QObject::tr("Open the Stutter tab for per-hitch evidence; enable Deep trace to see exactly which "
                                 "task or interrupt held the CPU.");
+        ctx.report(fi, 1);
+    }
+
+    // Compositor freezes: the desktop itself stopped (cursor, animations, input).
+    std::map<int, int> freezeClass;
+    std::map<QString, int> freezeSuspect;
+    int freezes = 0;
+    double worstFreeze = 0;
+    QString compositor;
+    for (const HitchNote& h : hs) {
+        if (now - h.tNs > 300'000'000'000LL || h.compositor.isEmpty())
+            continue;
+        ++freezes;
+        freezeClass[int(h.cls)]++;
+        if (!h.topSuspect.isEmpty())
+            freezeSuspect[h.topSuspect]++;
+        worstFreeze = std::max(worstFreeze, h.overshootMs);
+        compositor = h.compositor;
+    }
+    if (freezes > 0) {
+        const auto cls = std::max_element(freezeClass.begin(), freezeClass.end(), [](auto& a, auto& b) { return a.second < b.second; });
+        const HitchClass c = HitchClass(cls->first);
+        Finding fi;
+        fi.id = QStringLiteral("compositor-freeze");
+        fi.rule = fi.id;
+        fi.severity = freezes >= 3 || worstFreeze >= 250 ? Severity::Warning : Severity::Info;
+        fi.title = QObject::tr("%1 froze %2 time(s) in the last 5 minutes (worst %3), mostly: %4")
+                       .arg(compositor)
+                       .arg(freezes)
+                       .arg(fmt::ms(worstFreeze), hitchClassName(c));
+        fi.detail = hitchClassDescription(c);
+        std::vector<std::pair<int, QString>> sus;
+        for (auto& [name, n] : freezeSuspect)
+            sus.push_back({n, name});
+        std::sort(sus.rbegin(), sus.rend());
+        for (size_t i = 0; i < sus.size() && i < 4; ++i)
+            fi.suspects.push_back({QStringLiteral("suspect"), sus[i].second, 0, double(sus[i].first) / freezes,
+                                   QObject::tr("top suspect in %1 freeze(s)").arg(sus[i].first)});
+        switch (c) {
+        case HitchClass::GpuDriver:
+            fi.advice = QObject::tr("The Stutter tab lists the other processes that were inside the GPU driver at the time. "
+                                    "GPU-heavy background apps, screen capture and remote-desktop tools, and GPU monitoring "
+                                    "(NVML / nvidia-smi polling) are common causes; a different driver version may help.");
+            break;
+        case HitchClass::GarbageCollection:
+            fi.advice = QObject::tr("The compositor's JavaScript heap grows with extensions and uptime. Disable extensions "
+                                    "one at a time, or log out and back in to start with a fresh heap.");
+            break;
+        case HitchClass::Busy:
+            fi.advice = QObject::tr("Record a profile with Sysprof while reproducing the freeze to see which code ran, "
+                                    "and try again with extensions disabled.");
+            break;
+        case HitchClass::RunQueue:
+            fi.advice = QObject::tr("Other tasks kept the CPUs busy: the latency-probe hitches at the same time name them.");
+            break;
+        default:
+            fi.advice = QObject::tr("Open the Stutter tab for each freeze's breakdown; Deep trace adds the frozen thread's "
+                                    "kernel stack.");
+            break;
+        }
         ctx.report(fi, 1);
     }
 

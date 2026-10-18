@@ -28,6 +28,10 @@ QString hitchClassName(HitchClass c)
     case HitchClass::Gpu: return QStringLiteral("GPU");
     case HitchClass::CgroupThrottle: return QStringLiteral("Cgroup CPU quota");
     case HitchClass::Global: return QStringLiteral("System-wide stall");
+    case HitchClass::GpuDriver: return QStringLiteral("GPU driver");
+    case HitchClass::Busy: return QStringLiteral("Busy (own code)");
+    case HitchClass::GarbageCollection: return QStringLiteral("JavaScript GC");
+    case HitchClass::ThreadWait: return QStringLiteral("Waiting on a thread");
     case HitchClass::Unknown: return QStringLiteral("Unknown");
     }
     return {};
@@ -54,6 +58,17 @@ QString hitchClassDescription(HitchClass c)
     case HitchClass::Global:
         return QStringLiteral("Several CPUs stalled at the same moment: typical of SMIs/firmware, "
                               "stop_machine, TLB shootdown storms or a driver disabling interrupts.");
+    case HitchClass::GpuDriver:
+        return QStringLiteral("The thread was blocked inside the GPU kernel driver (an ioctl). With NVIDIA this is "
+                              "often a wait for the driver's lock while another process's request holds it.");
+    case HitchClass::Busy:
+        return QStringLiteral("The thread ran on a CPU the whole time: the program's own work (JavaScript, layout, "
+                              "painting or user-space graphics driver code).");
+    case HitchClass::GarbageCollection:
+        return QStringLiteral("The thread ran while its JavaScript helper threads were busy too: a garbage-collection "
+                              "pause. The heap grows with extensions and uptime.");
+    case HitchClass::ThreadWait:
+        return QStringLiteral("The thread slept on a lock (futex), waiting for another thread of the same process.");
     case HitchClass::Unknown:
         return QStringLiteral("No single cause stood out in the sampled counters.");
     }

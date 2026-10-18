@@ -62,6 +62,35 @@ struct Nvml::Api {
     nvmlReturn_t (*getComputeProcs)(nvmlDevice_t, unsigned*, nvmlProcessInfo_t*) = nullptr;
 };
 
+// Times one NVML call (after our own mutex, so only the driver's time counts).
+struct Nvml::BusyScope {
+    Nvml& nvml;
+    const char* what;
+    int64_t startNs = monoNs();
+    ~BusyScope() { nvml.noteBusy(startNs, what); }
+};
+
+void Nvml::noteBusy(int64_t startNs, const char* what)
+{
+    const int64_t now = monoNs();
+    if (now - startNs < 1'000'000)
+        return;
+    std::lock_guard lock(busyMutex_);
+    busy_.push_back({startNs, now, what});
+    while (busy_.size() > 64 || now - busy_.front().endNs > 30'000'000'000LL)
+        busy_.pop_front();
+}
+
+std::vector<Nvml::BusyInterval> Nvml::busyIntervals(int64_t sinceNs) const
+{
+    std::lock_guard lock(busyMutex_);
+    std::vector<BusyInterval> out;
+    for (const BusyInterval& b : busy_)
+        if (b.endNs >= sinceNs)
+            out.push_back(b);
+    return out;
+}
+
 Nvml& Nvml::instance()
 {
     static Nvml nvml;
@@ -120,6 +149,7 @@ void Nvml::sample(int index, GpuSample& g)
     if (!ok_ || index < 0 || index >= int(devices_.size()))
         return;
     std::lock_guard lock(mutex_);
+    BusyScope busy{*this, "status query"};
     nvmlDevice_t d = devices_[size_t(index)];
     g.index = index;
     unsigned v = 0;
@@ -189,6 +219,7 @@ void Nvml::processMemory(int index, std::vector<GpuProc>& out)
     if (!ok_ || index < 0 || index >= int(devices_.size()))
         return;
     std::lock_guard lock(mutex_);
+    BusyScope busy{*this, "process memory query"};
     nvmlDevice_t d = devices_[size_t(index)];
     std::unordered_map<int, uint64_t> mem;
     for (auto fn : {api_->getGraphicsProcs, api_->getComputeProcs}) {
@@ -208,24 +239,12 @@ void Nvml::processMemory(int index, std::vector<GpuProc>& out)
     }
 }
 
-bool Nvml::eventReasons(int index, uint64_t& reasons)
-{
-    if (!ok_ || index < 0 || index >= int(devices_.size()) || !api_->getReasons)
-        return false;
-    std::lock_guard lock(mutex_);
-    nvmlDevice_t d = devices_[size_t(index)];
-    unsigned long long r = 0;
-    if (api_->getReasons(d, &r) != NVML_SUCCESS)
-        return false;
-    reasons = r;
-    return true;
-}
-
 void Nvml::processUtilization(int index, std::unordered_map<int, GpuProc>& out)
 {
     if (!ok_ || index < 0 || index >= int(devices_.size()) || !api_->getProcUtil)
         return;
     std::lock_guard lock(mutex_);
+    BusyScope busy{*this, "process utilisation query"};
     nvmlDevice_t d = devices_[size_t(index)];
     // The first call reports buffer capacity rather than a sample count, so
     // just pass a generous buffer and ask for samples newer than the last seen.
@@ -252,10 +271,6 @@ void Nvml::processUtilization(int index, std::unordered_map<int, GpuProc>& out)
 
 // ------------------------------------------------------------------ collector
 
-namespace {
-constexpr int64_t kGpuProcRefreshNs = 3'000'000'000;
-} // namespace
-
 void GpuCollector::sample(Frame& frame)
 {
     Nvml& nvml = Nvml::instance();
@@ -275,7 +290,7 @@ void GpuCollector::sample(Frame& frame)
         GpuSample& g = frame.gpus[size_t(i)];
         nvml.sample(i, g);
         ProcCache& cache = procCache_[size_t(i)];
-        if (now - cache.refreshedNs >= kGpuProcRefreshNs) {
+        if (now - cache.refreshedNs >= procRefreshNs_) {
             nvml.processMemory(i, cache.procs);
             // An idle GPU has no per-process utilisation to report.
             std::unordered_map<int, GpuProc> util;

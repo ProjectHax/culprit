@@ -109,6 +109,16 @@ void HelperClient::requestWindow(quint64 id, int cpu, qint64 t0Ns, qint64 t1Ns)
         send(QStringLiteral("window %1 %2 %3 %4\n").arg(id).arg(cpu).arg(t0Ns).arg(t1Ns).toLatin1());
 }
 
+void HelperClient::requestStacks(quint64 id, const std::vector<int>& tids)
+{
+    if (state_ != HelperStatus::State::Running || tids.empty())
+        return;
+    QByteArray line = "stacks " + QByteArray::number(id);
+    for (size_t i = 0; i < tids.size() && i < 32; ++i)
+        line += ' ' + QByteArray::number(tids[i]);
+    send(line + '\n');
+}
+
 void HelperClient::setFocus(int pid)
 {
     if (state_ == HelperStatus::State::Running)

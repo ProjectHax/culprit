@@ -43,6 +43,25 @@ std::string_view stackFrame(std::string_view line)
     return trim(line);
 }
 
+// /proc/<tid>/stack as a JSON array of function names (at most 16 frames).
+std::string kernelStack(const std::string& base, std::string& buf)
+{
+    JsonArr stack;
+    if (readFile(base + "/stack", buf)) {
+        LineReader lines(buf);
+        std::string_view line;
+        int frames = 0;
+        while (lines.next(line) && frames < 16) {
+            const std::string_view f = stackFrame(line);
+            if (!f.empty()) {
+                stack.addStr(f);
+                ++frames;
+            }
+        }
+    }
+    return stack.done();
+}
+
 bool writeFile(const std::string& path, const std::string& value)
 {
     const int fd = ::open(path.c_str(), O_WRONLY | O_CLOEXEC);
@@ -85,19 +104,7 @@ void PrivProc::dstate(int64_t nowNs, std::string& out)
             const int64_t since = dSince_.try_emplace(tid, nowNs).first->second;
             std::string wchan;
             readFirstLine(base + "/wchan", wchan);
-            JsonArr stack;
-            if (readFile(base + "/stack", buf_)) {
-                LineReader lines(buf_);
-                std::string_view line;
-                int frames = 0;
-                while (lines.next(line) && frames < 16) {
-                    const std::string_view f = stackFrame(line);
-                    if (!f.empty()) {
-                        stack.addStr(f);
-                        ++frames;
-                    }
-                }
-            }
+            const std::string stack = kernelStack(base, buf_);
             std::string procComm;
             readFirstLine("/proc/" + std::to_string(pid) + "/comm", procComm);
             rows.add(JsonObj()
@@ -106,7 +113,7 @@ void PrivProc::dstate(int64_t nowNs, std::string& out)
                          .str("comm", comm)
                          .str("proc", procComm)
                          .str("wchan", wchan == "0" ? std::string() : wchan)
-                         .raw("stack", stack.done())
+                         .raw("stack", stack)
                          .dbl("age_ms", double(nowNs - since) / 1e6, 0)
                          .done());
             ++n;
@@ -116,6 +123,36 @@ void PrivProc::dstate(int64_t nowNs, std::string& out)
         it = seen.count(it->first) ? std::next(it) : dSince_.erase(it);
     JsonObj("dstate").raw("rows", rows.done()).line(out);
     lastHadRows_ = n > 0;
+}
+
+void PrivProc::stacks(uint64_t id, const std::vector<int>& tids, std::string& out)
+{
+    JsonArr rows;
+    for (int tid : tids) {
+        const std::string base = "/proc/" + std::to_string(tid);   // a thread id works at the top level too
+        PidStat ps;
+        PidStatus st;
+        if (!readFile(base + "/stat", buf_) || !parsePidStat(buf_, ps))
+            continue;
+        const std::string comm(ps.comm);
+        const char state[2] = {ps.state, 0};
+        if (!readFile(base + "/status", buf_) || !parsePidStatus(buf_, st))
+            continue;
+        std::string wchan, procComm;
+        readFirstLine(base + "/wchan", wchan);
+        readFirstLine("/proc/" + std::to_string(st.tgid) + "/comm", procComm);
+        const std::string stack = kernelStack(base, buf_);
+        rows.add(JsonObj()
+                     .num("pid", st.tgid)
+                     .num("tid", tid)
+                     .str("comm", comm)
+                     .str("proc", procComm)
+                     .str("state", state)
+                     .str("wchan", wchan == "0" ? std::string() : wchan)
+                     .raw("stack", stack)
+                     .done());
+    }
+    JsonObj("stacks").unum("id", id).raw("rows", rows.done()).line(out);
 }
 
 void PrivProc::pio(int64_t nowNs, std::string& out)

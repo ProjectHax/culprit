@@ -24,15 +24,20 @@
 #include "gui/widgets/WindowChrome.h"
 
 #include <QAction>
+#include <QApplication>
+#include <QCloseEvent>
 #include <QDateTime>
 #include <QDir>
 #include <QFileDialog>
 #include <QElapsedTimer>
 #include <QEvent>
 #include <QLabel>
+#include <QMenu>
 #include <QPainter>
 #include <QStatusBar>
+#include <QSystemTrayIcon>
 #include <QTabWidget>
+#include <QTimer>
 #include <QToolBar>
 #include <QToolButton>
 
@@ -73,7 +78,11 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent), settings_(Setting
     settingsAct_->setToolTip(tr("Appearance, sampling, stutter detection and diagnosis settings — Ctrl+,"));
     aboutAct_ = new QAction(tr("About"), this);
     aboutAct_->setToolTip(tr("Version, copyright and licenses"));
-    addActions({pauseAct_, recordAct_, exportAct_, settingsAct_, aboutAct_});
+    trayAct_ = new QAction(tr("Hide to tray"), this);
+    trayAct_->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_H));
+    trayAct_->setToolTip(tr("Keep watching and logging from the system tray, drawing nothing until you bring Culprit back — Ctrl+H"));
+    addActions({pauseAct_, recordAct_, exportAct_, trayAct_, settingsAct_, aboutAct_});
+    connect(trayAct_, &QAction::triggered, this, &MainWindow::hideToTray);
     connect(recordAct_, &QAction::toggled, this, &MainWindow::toggleRecording);
     connect(exportAct_, &QAction::triggered, this, &MainWindow::exportReport);
     connect(settingsAct_, &QAction::triggered, this, &MainWindow::showSettings);
@@ -85,6 +94,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent), settings_(Setting
     toolbar_->setToolButtonStyle(Qt::ToolButtonTextOnly);
     toolbar_->addActions({pauseAct_, recordAct_, exportAct_});
     toolbar_->addSeparator();
+    toolbar_->addAction(trayAct_);
     toolbar_->addAction(settingsAct_);
     toolbar_->addAction(aboutAct_);
     for (QToolButton* b : toolbar_->findChildren<QToolButton*>())
@@ -107,18 +117,18 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent), settings_(Setting
     addTab(processes_, QStringLiteral("processes"), tr("Processes"));
     connect(processes_, &ProcessesTab::statusMessage, this, [this](const QString& m) { statusBar()->showMessage(m, 8000); });
 
-    auto* thermals = new ThermalsTab;
+    thermals_ = new ThermalsTab;
     connect(tabs_, &QTabWidget::currentChanged, this,
-            [this, thermals](int) { engine_->engine()->setSensorsWatched(tabs_->currentWidget() == thermals->parentWidget()); });
-    addTab(thermals, QStringLiteral("thermals"), tr("Thermals && Power"));
-    connect(thermals, &ThermalsTab::processActivated, this, &MainWindow::showProcess);
+            [this](int) { engine_->engine()->setSensorsWatched(!background_ && tabs_->currentWidget() == thermals_->parentWidget()); });
+    addTab(thermals_, QStringLiteral("thermals"), tr("Thermals && Power"));
+    connect(thermals_, &ThermalsTab::processActivated, this, &MainWindow::showProcess);
 
     auto* load = new LoadIoTab;
     addTab(load, QStringLiteral("load"), tr("Load && I/O"));
     connect(load, &LoadIoTab::processActivated, this, &MainWindow::showProcess);
     connect(findings_, &FindingsPanel::processActivated, this, &MainWindow::showProcess);
 
-    stutter_ = new StutterTab(engine_->engine()->latencyFeed(), settings_);
+    stutter_ = new StutterTab(engine_->engine()->latencyFeed(), engine_->engine()->compositorFeed(), settings_);
     addTab(stutter_, QStringLiteral("stutter"), tr("Stutter"));
     connect(engine_->engine(), &Engine::hitchDetected, stutter_, &StutterTab::addHitch, Qt::QueuedConnection);
     connect(stutter_, &StutterTab::processActivated, this, &MainWindow::showProcess);
@@ -148,6 +158,8 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent), settings_(Setting
     connect(engine_->engine(), &Engine::hitchDetected, this, [this](const Hitch& h) {
         if (recorder_)
             recorder_->writeHitch(h);
+        if (background_)
+            noteBackgroundHitch(h);
     }, Qt::QueuedConnection);
     connect(engine_->engine(), &Engine::hitchUpdated, this, [this](const Hitch& h) {
         if (recorder_)
@@ -180,6 +192,7 @@ void MainWindow::applyChrome()
             titleBar_->addAction(recordAct_);
             titleBar_->addAction(exportAct_);
             titleBar_->addSeparator();
+            titleBar_->addAction(trayAct_);
             titleBar_->addAction(settingsAct_);
             titleBar_->addAction(aboutAct_);
             setMenuWidget(titleBar_);
@@ -210,8 +223,113 @@ void MainWindow::paintEvent(QPaintEvent* e)
 void MainWindow::changeEvent(QEvent* e)
 {
     QMainWindow::changeEvent(e);
-    if (e->type() == QEvent::WindowStateChange && chrome_ && chrome_->isActive())
+    if (e->type() != QEvent::WindowStateChange)
+        return;
+    if (chrome_ && chrome_->isActive())
         setContentsMargins(windowState() & (Qt::WindowMaximized | Qt::WindowFullScreen) ? QMargins() : QMargins(1, 1, 1, 1));
+    // Qt only learns about minimizing it asked for (our title bar) or on X11;
+    // GNOME on Wayland doesn't tell clients, hence the explicit Hide to tray.
+    if (isMinimized() && settings_.minimizeToTray && QSystemTrayIcon::isSystemTrayAvailable())
+        QTimer::singleShot(0, this, &MainWindow::hideToTray);
+    updateBackground();
+}
+
+void MainWindow::showEvent(QShowEvent* e)
+{
+    QMainWindow::showEvent(e);
+    updateBackground();
+}
+
+void MainWindow::hideEvent(QHideEvent* e)
+{
+    QMainWindow::hideEvent(e);
+    updateBackground();
+}
+
+void MainWindow::closeEvent(QCloseEvent* e)
+{
+    QMainWindow::closeEvent(e);
+    // Closing the window quits, tray icon or not (dialogs closing while we're
+    // in the tray must not, so the application doesn't quit on its own).
+    if (e->isAccepted())
+        QCoreApplication::quit();
+}
+
+void MainWindow::hideToTray()
+{
+    if (!QSystemTrayIcon::isSystemTrayAvailable()) {
+        statusBar()->showMessage(tr("No system tray is available. On GNOME, the AppIndicator extension provides one."), 10000);
+        return;
+    }
+    if (!tray_) {
+        tray_ = new QSystemTrayIcon(QApplication::windowIcon(), this);
+        auto* menu = new QMenu(this);
+        menu->addAction(tr("Show Culprit"), this, &MainWindow::showFromTray);
+        menu->addAction(recordAct_);
+        menu->addSeparator();
+        menu->addAction(tr("Quit"), qApp, &QCoreApplication::quit);
+        tray_->setContextMenu(menu);
+        connect(tray_, &QSystemTrayIcon::activated, this, [this](QSystemTrayIcon::ActivationReason r) {
+            if (r == QSystemTrayIcon::Trigger || r == QSystemTrayIcon::DoubleClick)
+                showFromTray();
+        });
+        trayTipTimer_ = new QTimer(this);
+        trayTipTimer_->setSingleShot(true);
+        trayTipTimer_->setInterval(5000);   // the tray host (often in the compositor) redraws on every change
+        connect(trayTipTimer_, &QTimer::timeout, this, &MainWindow::updateTrayToolTip);
+    }
+    bgHitches_ = bgFreezes_ = 0;
+    bgWorstFreezeMs_ = 0;
+    updateTrayToolTip();
+    tray_->show();
+    hide();
+    updateBackground();   // also when the window was never shown (--tray)
+}
+
+void MainWindow::showFromTray()
+{
+    if (tray_)
+        tray_->hide();
+    setWindowState(windowState() & ~Qt::WindowMinimized);
+    show();
+    raise();
+    activateWindow();
+}
+
+void MainWindow::updateBackground()
+{
+    const bool bg = !isVisible() || isMinimized();
+    if (bg == background_)
+        return;
+    background_ = bg;
+    engine_->engine()->setBackground(bg);
+    engine_->engine()->setSensorsWatched(!bg && tabs_->currentWidget() == thermals_->parentWidget());
+    if (!bg && lastFrame_ && lastFrame_->seq != renderedSeq_)
+        onFrame(lastFrame_);   // catch the views up once
+}
+
+void MainWindow::noteBackgroundHitch(const Hitch& h)
+{
+    if (h.source == HitchSource::Compositor) {
+        ++bgFreezes_;
+        bgWorstFreezeMs_ = std::max(bgWorstFreezeMs_, h.maxOvershootMs);
+    } else {
+        ++bgHitches_;
+    }
+    if (trayTipTimer_ && !trayTipTimer_->isActive())
+        trayTipTimer_->start();
+}
+
+void MainWindow::updateTrayToolTip()
+{
+    if (!tray_)
+        return;
+    QString tip = tr("Culprit is watching in the background.");
+    if (bgFreezes_ > 0)
+        tip += QLatin1Char('\n') + tr("%1 compositor freeze(s) since hidden, worst %2").arg(bgFreezes_).arg(fmt::ms(bgWorstFreezeMs_));
+    if (bgHitches_ > 0)
+        tip += QLatin1Char('\n') + tr("%1 latency hitch(es) since hidden").arg(bgHitches_);
+    tray_->setToolTip(tip);
 }
 
 void MainWindow::showSettings()
@@ -312,6 +430,12 @@ void MainWindow::showProcess(int pid)
 
 void MainWindow::onFrame(const FramePtr& frame)
 {
+    lastFrame_ = frame;
+    if (recorder_)
+        recorder_->writeFrame(*frame);
+    if (background_)
+        return;   // hidden: keep logging, draw nothing
+    renderedSeq_ = frame->seq;
     static const bool timing = qEnvironmentVariableIsSet("CULPRIT_DEBUG_TIMING");
     QElapsedTimer t;
     t.start();
@@ -324,9 +448,7 @@ void MainWindow::onFrame(const FramePtr& frame)
     }
     const qint64 t1 = t.nsecsElapsed();
     findings_->setFindings(frame->findings);
-    lastFrame_ = frame;
     if (recorder_) {
-        recorder_->writeFrame(*frame);
         statusRec_->setText(tr("● Recording %1 · %2 hitch(es)").arg(fmt::bytes(double(recorder_->bytes()))).arg(recorder_->hitchCount()));
         statusRec_->setStyleSheet(QStringLiteral("color:#e5484d"));
     }

@@ -5,7 +5,6 @@
 
 #include "common/parse/PidParsers.h"
 #include "common/util/Clock.h"
-#include "core/collect/GpuCollector.h"
 
 #include <QtGlobal>
 
@@ -16,15 +15,16 @@
 namespace culprit {
 
 namespace {
-constexpr int64_t kTickNs = 20'000'000;          // 50 Hz
-constexpr size_t kRingSize = 512;                // ~10 s
+constexpr int64_t kTickNs = 40'000'000;          // 25 Hz
+constexpr size_t kRingSize = 256;                // ~10 s
 constexpr int64_t kPreNs = 600'000'000;          // capture before the hitch
 constexpr int64_t kPostNs = 200'000'000;         // ... and after
 constexpr int64_t kMergeNs = 50'000'000;         // late wakeups closer than this are one hitch
 constexpr int64_t kMaxHitchNs = 1'000'000'000;   // split continuous stalling into 1 s pieces
 constexpr int kMaxCapturesPerSec = 4;
-constexpr uint64_t kFullEvery = uint64_t(kFlightFullPeriodNs / kTickNs);   // 10 Hz
-constexpr uint64_t kIrqEvery = 20;                                          // 2.5 Hz
+constexpr uint64_t kFullEvery = uint64_t(kFlightFullPeriodNs / kTickNs);   // 5 Hz
+constexpr uint64_t kIrqEvery = 10;                                          // 2.5 Hz
+constexpr uint64_t kHotEvery = 5;                                           // 5 Hz
 } // namespace
 
 // ------------------------------------------------------------------ feed
@@ -100,6 +100,9 @@ bool FlightRecorder::start(const Settings& settings, const std::string& cpuTempP
     }
     if (!applyProbeMode(settings, error))
         return false;
+    // Everything recorded here serves the analysis of probe hitches.
+    if (settings.probeMode == ProbeMode::Off)
+        return true;
     stop_ = false;
     thread_ = std::thread([this] { loop(); });
     return true;
@@ -190,10 +193,10 @@ void FlightRecorder::loop()
 
 void FlightRecorder::tick(int64_t now, uint64_t n)
 {
-    // Probes drain at 50 Hz. The procfs reads are expensive on many-CPU machines
-    // (/proc/schedstat ~240 µs, /proc/interrupts ~520 µs with 32 CPUs), so they
-    // run at 10 Hz and 2.5 Hz, plus once right after a probe reports a hitch:
-    // that keeps a sample within ~60 ms after every stall at a third of the cost.
+    // Probes drain at 25 Hz. The procfs reads are expensive on many-CPU machines
+    // (/proc/schedstat ~240 µs, /proc/interrupts ~550 µs with 32 CPUs), so they
+    // run at 5 Hz and 2.5 Hz, plus once right after a probe reports a hitch:
+    // that keeps a sample within ~40 ms after every stall at a fraction of the cost.
     static const bool timing = qEnvironmentVariableIsSet("CULPRIT_DEBUG_TIMING");
     const int64_t tA = timing ? monoNs() : 0;
     if (drainProbes(now))
@@ -202,7 +205,10 @@ void FlightRecorder::tick(int64_t now, uint64_t n)
     FlightSample& s = ring_[head_];
     s.tNs = now;
     s.valid = 0;
-    if (n % kFullEvery == 0 || (wantFull_ && n - lastFullTick_ >= 2)) {
+    // GPU clock reasons come from the engine's 1 Hz sample: every NVML call here
+    // would take the NVIDIA driver's lock, which the compositor needs too.
+    const bool full = n % kFullEvery == 0 || (wantFull_ && n != lastFullTick_);
+    if (full) {
         readSched(s);
         readStat(s);
         readSoftirq(s);
@@ -212,7 +218,7 @@ void FlightRecorder::tick(int64_t now, uint64_t n)
         wantFull_ = false;
     }
     const int64_t tC = timing ? monoNs() : 0;
-    if (n % 5 == 0) {
+    if (full) {
         int64_t mc = 0;
         if (tempFile_.readInt64(mc)) {
             s.tctl = float(double(mc) / 1000.0);
@@ -223,34 +229,29 @@ void FlightRecorder::tick(int64_t now, uint64_t n)
             s.freqKHz[size_t(c)] = freqFiles_[size_t(c)].readInt64(khz) ? uint32_t(khz) : 0;
         }
         s.valid |= FlightSample::kFreq;
-        uint64_t reasons = 0;
-        if (Nvml::instance().ok() && Nvml::instance().eventReasons(0, reasons)) {
-            s.gpuReasons = reasons;
-            s.valid |= FlightSample::kGpu;
-        }
     }
     const int64_t tD = timing ? monoNs() : 0;
-    if (n % kIrqEvery == 0 || (wantIrq_ && n - lastIrqTick_ >= 5)) {
+    if (n % kIrqEvery == 0 || (wantIrq_ && n - lastIrqTick_ >= 3)) {
         readIrqs(now);
         lastIrqTick_ = n;
         wantIrq_ = false;
     }
     const int64_t tE = timing ? monoNs() : 0;
-    if (n % 10 == 5)
+    if (n % kHotEvery == 2)
         readHot(now);
 
     head_ = (head_ + 1) % ring_.size();
     filled_ = std::min(filled_ + 1, ring_.size());
     finalizeReady(now);
     if (timing) {
-        // Per-second totals: probe drain, full counters, freq/temp/GPU, interrupts, hot processes.
+        // Per-second totals: probe drain, full counters, freq/temp, interrupts, hot processes.
         static double sum[5];
         const int64_t tF = monoNs();
         const int64_t parts[5] = {tB - tA, tC - tB, tD - tC, tE - tD, tF - tE};
         for (int i = 0; i < 5; ++i)
             sum[i] += double(parts[i]) / 1e6;
-        if (n % 50 == 49) {
-            std::fprintf(stderr, "flight/s: drain %.2f ms, counters %.2f ms, freq+temp+gpu %.2f ms, irqs %.2f ms, hot %.2f ms\n",
+        if (n % 25 == 24) {
+            std::fprintf(stderr, "flight/s: drain %.2f ms, counters %.2f ms, freq+temp %.2f ms, irqs %.2f ms, hot %.2f ms\n",
                          sum[0], sum[1], sum[2], sum[3], sum[4]);
             std::fill(std::begin(sum), std::end(sum), 0.0);
         }

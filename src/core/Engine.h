@@ -32,6 +32,8 @@ class FlightRecorder;
 class HitchAnalyzer;
 class LatencyFeed;
 class HelperClient;
+class CompositorProbe;
+struct CompositorStall;
 struct HitchCapture;
 
 // The sampling engine. Lives in its own thread; every interval it runs all
@@ -49,9 +51,12 @@ public:
     void setFocusPid(int pid);                    // 0 = none
     void setSensorsWatched(bool watched);         // poll slow sensor chips more often
     void setDeepTrace(bool on);                   // start/stop the root helper
+    void setBackground(bool on);                  // window hidden: sample less, skip what only the views need
 
     // Live probe latency series, readable from any thread.
     std::shared_ptr<LatencyFeed> latencyFeed() const { return feed_; }
+    // Live compositor response series (Wayland ping round trips).
+    std::shared_ptr<LatencyFeed> compositorFeed() const { return compositorFeed_; }
 
 signals:
     void frameReady(culprit::FramePtr frame);
@@ -65,10 +70,12 @@ public slots:
 private:
     void tick();
     void sampleSelf(SelfStats& out, int64_t nowNs);
+    int intervalMs() const;
 
     Settings settings_;
     QTimer* timer_ = nullptr;
     bool paused_ = false;
+    bool background_ = false;
     uint64_t seq_ = 0;
 
     std::unique_ptr<SystemCollector> system_;
@@ -85,6 +92,15 @@ private:
     std::shared_ptr<LatencyFeed> feed_;
     std::unique_ptr<FlightRecorder> flight_;
     std::unique_ptr<HitchAnalyzer> analyzer_;
+
+    void startCompositorProbe();
+    void onCompositorStall(const CompositorStall& s);
+    void onCompositorOngoing(uint64_t seq, const std::vector<int>& tids);
+    std::shared_ptr<LatencyFeed> compositorFeed_;
+    std::unique_ptr<CompositorProbe> compositor_;
+    std::unordered_map<uint64_t, std::vector<ThreadStack>> stallStacks_;   // by probe seq, arrived before the freeze ended
+    std::unordered_map<uint64_t, Hitch> awaitingStacks_;                    // freezes whose stacks are still on their way
+    std::unordered_set<uint64_t> stacksRequested_;
     FramePtr lastFrame_;
     QString probeError_;
 

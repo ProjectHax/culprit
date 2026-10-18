@@ -32,6 +32,7 @@ struct HitchNote {
     HitchClass cls = HitchClass::Unknown;
     QString topSuspect;
     double periodSec = 0;
+    QString compositor;   // compositor freezes: its process name (empty for probe hitches)
 };
 
 // State that rules keep between evaluations.

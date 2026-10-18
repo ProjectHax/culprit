@@ -115,7 +115,7 @@ struct SystemSample {
     std::vector<CpuCoreSample> cpus;
     double load1 = 0, load5 = 0, load15 = 0;
     uint32_t procsRunning = 0, procsBlocked = 0, threadsTotal = 0;
-    double avgRunnable = -1, avgBlocked = -1;   // averaged at 50 Hz by the flight recorder, -1 if unknown
+    double avgRunnable = -1, avgBlocked = -1;   // averaged at 5 Hz by the flight recorder, -1 if unknown (probes off)
     double ctxtPs = 0, intrPs = 0, forksPs = 0;
     double runDelayTotalPct = 0;                // sum over CPUs: avg number of waiting tasks x100
     MemSample mem;
@@ -296,6 +296,17 @@ struct StutterSummary {
     QString error;
 };
 
+struct CompositorSummary {
+    bool watching = false;      // connected to the Wayland compositor and sampling it
+    QString name;               // "gnome-shell"
+    int pid = 0;
+    QString message;            // why it isn't watching
+    double thresholdMs = 0;
+    double typicalMs = -1;      // median Wayland ping round trip, last second
+    double worstMs = -1;        // worst response during this interval (an unanswered ping counts)
+    uint64_t freezes = 0;
+};
+
 struct SelfStats {
     double cpuPct = 0;        // Culprit's own CPU usage (all threads)
     uint64_t rssBytes = 0;
@@ -318,6 +329,7 @@ struct Frame {
     HelperStatus helper;
     DeepSummary deep;
     StutterSummary stutter;
+    CompositorSummary compositor;
     SelfStats self;
 
     const ProcSample* findProc(int pid) const;

@@ -39,6 +39,8 @@ add_library(culprit_core STATIC
   model/Frame.h
   model/Hitch.h
   model/Model.cpp
+  stutter/CompositorProbe.cpp
+  stutter/CompositorProbe.h
   stutter/FlightRecorder.cpp
   stutter/FlightRecorder.h
   stutter/HitchAnalyzer.cpp

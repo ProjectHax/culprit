@@ -27,7 +27,8 @@ class TimelineView;
 class StutterTab : public TabPage {
     Q_OBJECT
 public:
-    StutterTab(std::shared_ptr<LatencyFeed> feed, const Settings& settings, QWidget* parent = nullptr);
+    StutterTab(std::shared_ptr<LatencyFeed> feed, std::shared_ptr<LatencyFeed> compositorFeed, const Settings& settings,
+               QWidget* parent = nullptr);
 
     void addHitch(const Hitch& h);
     void updateHitch(const Hitch& h);   // deep-trace details arrived
@@ -57,6 +58,7 @@ private:
     double thresholdFor(ProbeMode m) const;
 
     std::shared_ptr<LatencyFeed> feed_;
+    std::shared_ptr<LatencyFeed> compositorFeed_;
     Settings settings_;
     QComboBox* mode_;
     QDoubleSpinBox* threshold_;
@@ -64,6 +66,7 @@ private:
     QPushButton* deep_;
     QLabel* status_;
     QLabel* deepStatus_;
+    QLabel* compositorStatus_;
     TimelineView* graph_;
     QTabWidget* lists_;
     DataTable* table_;
